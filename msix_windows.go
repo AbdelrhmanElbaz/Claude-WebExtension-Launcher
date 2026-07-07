@@ -3,6 +3,7 @@
 package main
 
 import (
+	"claude-webext-patcher/utils"
 	"fmt"
 	"os"
 	"os/exec"
@@ -10,22 +11,38 @@ import (
 	"strings"
 )
 
+// msixChoiceHandled reports whether a saved decision already covers this launch, so
+// no prompt is needed. Only a "keep" for the current launcher version qualifies; a
+// stale "keep:" (older version) or an "uninstall" (MSIX reinstalled) still prompts.
+func msixChoiceHandled() bool {
+	return loadMSIXChoice() == "keep:"+Version
+}
+
 func checkMSIXAndPrompt(instanceName string) {
-	if !isMSIXInstalled() {
+	// Fast path (no lock): nothing installed, or a still-valid decision is saved.
+	if !isMSIXInstalled() || msixChoiceHandled() {
+		return
+	}
+
+	// Serialize with other concurrently-launched instances so only one prompts. The
+	// first instance decides and persists it; the rest re-check below and skip. Reuse
+	// the patch lock name so this can't interleave with patching.
+	lock, locked := utils.AcquirePatchLock(patchLockName, patchLockTimeout)
+	if locked {
+		defer lock.Release()
+	}
+	// If we couldn't get the lock in time, fall through — the re-check below usually
+	// short-circuits anyway (decision saved / MSIX already removed by another instance).
+
+	// Re-evaluate under the lock: another instance may have just handled it.
+	if !isMSIXInstalled() || msixChoiceHandled() {
 		return
 	}
 
 	choice := loadMSIXChoice()
-
 	if strings.HasPrefix(choice, "keep:") {
-		savedVersion := strings.TrimPrefix(choice, "keep:")
-		if savedVersion == Version {
-			return
-		}
 		fmt.Println("Launcher version changed since you last chose to keep the official Claude app.")
-	}
-
-	if choice == "uninstall" {
+	} else if choice == "uninstall" {
 		fmt.Println("Official Claude MSIX was reinstalled since you last removed it.")
 	}
 

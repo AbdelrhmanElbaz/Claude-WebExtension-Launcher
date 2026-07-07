@@ -36,8 +36,8 @@ const (
 	windowsMSIXRedirectURLFmt = "https://claude.ai/api/desktop/win32/%s/msix/latest/redirect"
 	macosReleasesURL          = "https://downloads.claude.ai/releases/darwin/universal/RELEASES.json"
 	appFolderName             = "app-latest"
-	KeepNupkgFiles            = false
-	PatchVersion              = "7"
+	KeepDownloadedArchive     = false
+	PatchVersion              = "9"
 )
 
 type MacOSManifest struct {
@@ -263,6 +263,63 @@ func canFallbackToExisting() bool {
 	return err == nil
 }
 
+const stagingSuffix = ".staging"
+
+// buildAndSwap downloads and patches a fresh Claude into a staging folder, then
+// atomically swaps it into place as AppFolder. The live install is never touched
+// until the final swap, so a failed/interrupted patch (or a locked claude.exe held
+// by a running instance) leaves the previous working install intact rather than a
+// half-written or stock one. On return the app-folder globals point back at the real
+// install, so canFallbackToExisting() checks the right place.
+func buildAndSwap(version, downloadURL string) error {
+	realApp := AppFolder
+	staging := realApp + stagingSuffix
+
+	os.RemoveAll(staging) // clear any leftover from a previous aborted run
+	setAppPaths(staging)  // build everything into the staging folder
+	defer setAppPaths(realApp)
+
+	if err := downloadAndExtract(version, downloadURL); err != nil {
+		os.RemoveAll(staging)
+		return err
+	}
+	if err := applyPatches(version); err != nil {
+		os.RemoveAll(staging)
+		return err
+	}
+	if err := swapAppFolder(staging, realApp); err != nil {
+		os.RemoveAll(staging)
+		return err
+	}
+	return nil
+}
+
+// swapAppFolder replaces target with staging via two renames (os.Rename cannot
+// atomically replace an existing directory on Windows). The window where target is
+// absent is a couple of fast metadata ops. If moving the old install aside fails
+// (e.g. a running claude.exe holds a lock), the old install is left in place.
+func swapAppFolder(staging, target string) error {
+	backup := target + ".old"
+	os.RemoveAll(backup)
+
+	if _, err := os.Stat(target); err == nil {
+		if err := os.Rename(target, backup); err != nil {
+			return fmt.Errorf("moving old install aside (is Claude still running?): %w", err)
+		}
+	}
+
+	if err := os.Rename(staging, target); err != nil {
+		// Roll the old install back so we're never left without one.
+		if _, berr := os.Stat(backup); berr == nil {
+			os.Rename(backup, target)
+		}
+		return fmt.Errorf("swapping in new install: %w", err)
+	}
+
+	os.RemoveAll(backup)
+	return nil
+}
+
 func EnsurePatched(forceUpdate bool) error {
 	if err := prepareInstallDir(); err != nil {
 		return fmt.Errorf("setting up install directory: %v", err)
@@ -298,69 +355,55 @@ func EnsurePatched(forceUpdate bool) error {
 
 	fmt.Printf("Latest version: %s\n", newestVersion)
 
-	// Always update to the latest version
-	shouldUpdate := currentVersion != newestVersion
-	if shouldUpdate {
+	// Update to the latest version, or rebuild in place when forced (the
+	// --force-update recovery path re-applies a lost/corrupted patch even when the
+	// Claude version is unchanged).
+	versionChanged := currentVersion != newestVersion
+	shouldUpdate := forceUpdate || versionChanged
+	if versionChanged {
 		if !IsVersionVerified(newestVersion) {
 			fmt.Printf("Note: Version %s has not been explicitly verified, but should work fine.\n", newestVersion)
 			fmt.Println("If you run into issues, let me know on GitHub.")
 		}
 	}
 
-	// Update if needed
 	patchVersionFile := filepath.Join(installBaseDir, "patch-version.txt")
 	if shouldUpdate {
-		fmt.Printf("Updating to %s...\n", newestVersion)
+		if versionChanged {
+			fmt.Printf("Updating to %s...\n", newestVersion)
+		} else {
+			fmt.Printf("Re-applying patch for %s...\n", newestVersion)
+		}
 
-		if err := downloadAndExtract(newestVersion, downloadURL); err != nil {
+		if err := buildAndSwap(newestVersion, downloadURL); err != nil {
 			if canFallbackToExisting() {
-				fmt.Printf("Warning: download/extract failed (%v), continuing with existing installation.\n", err)
+				fmt.Printf("Warning: update failed (%v), continuing with existing installation.\n", err)
 				debugPause()
 				return nil
 			}
 			return err
 		}
-
-		// Write version
+		// Record success only after the new install is fully built and swapped in,
+		// so an interrupted patch can never leave a stale "patched" marker on a stock app.
 		os.WriteFile(claudeVersionFile, []byte(newestVersion), 0644)
-
-		// Apply patches
-		if err := applyPatches(newestVersion); err != nil {
-			if canFallbackToExisting() {
-				fmt.Printf("Warning: patching failed (%v), continuing with existing installation.\n", err)
-				debugPause()
-				return nil
-			}
-			return fmt.Errorf("applying patches: %v", err)
-		}
 		os.WriteFile(patchVersionFile, []byte(PatchVersion), 0644)
 	} else {
-		if currentVersion == newestVersion {
-			fmt.Println("Already on the latest version")
-		}
+		fmt.Println("Already on the latest version")
 
-		// Check if injection code needs updating
+		// Injection code changed but the Claude version didn't — re-patch.
 		currentPatchVersion := ""
 		if data, err := os.ReadFile(patchVersionFile); err == nil {
 			currentPatchVersion = strings.TrimSpace(string(data))
 		}
 		if currentPatchVersion != PatchVersion {
-			fmt.Printf("Patch version changed (%s -> %s), re-downloading and re-patching...\n", currentPatchVersion, PatchVersion)
-			if err := downloadAndExtract(newestVersion, downloadURL); err != nil {
-				if canFallbackToExisting() {
-					fmt.Printf("Warning: re-download failed (%v), continuing with existing installation.\n", err)
-					debugPause()
-					return nil
-				}
-				return err
-			}
-			if err := applyPatches(newestVersion); err != nil {
+			fmt.Printf("Patch version changed (%s -> %s), re-patching...\n", currentPatchVersion, PatchVersion)
+			if err := buildAndSwap(newestVersion, downloadURL); err != nil {
 				if canFallbackToExisting() {
 					fmt.Printf("Warning: re-patching failed (%v), continuing with existing installation.\n", err)
 					debugPause()
 					return nil
 				}
-				return fmt.Errorf("applying patches: %v", err)
+				return err
 			}
 			os.WriteFile(claudeVersionFile, []byte(newestVersion), 0644)
 			os.WriteFile(patchVersionFile, []byte(PatchVersion), 0644)

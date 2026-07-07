@@ -16,10 +16,16 @@ import (
 )
 
 func initPaths() {
-	AppFolder = utils.ResolveInstallPath(appFolderName)
 	installBaseDir = utils.ResolveInstallPath(".")
-	appResourcesDir = filepath.Join(AppFolder, "resources")
-	appExePath = filepath.Join(AppFolder, "claude.exe")
+	setAppPaths(utils.ResolveInstallPath(appFolderName))
+}
+
+// setAppPaths points the app-folder globals at appFolder. buildAndSwap uses this to
+// build a patched install in a staging folder before swapping it into place.
+func setAppPaths(appFolder string) {
+	AppFolder = appFolder
+	appResourcesDir = filepath.Join(appFolder, "resources")
+	appExePath = filepath.Join(appFolder, "claude.exe")
 }
 
 // TakeWindowsAppsOwnership grants Administrators read/traverse/create access on the WindowsApps directory.
@@ -238,20 +244,20 @@ func downloadAndExtract(version, downloadURL string) error {
 
 	// Define the download path based on whether we keep files or use temp
 	var newVersionDownloadPath string
-	if KeepNupkgFiles {
+	if KeepDownloadedArchive {
 		newVersionDownloadPath = utils.ResolvePath(newVersionZipName)
 	} else {
 		newVersionDownloadPath = utils.ResolvePath(newVersionZipName + ".tmp")
 	}
 
-	// Check if file already exists when KeepNupkgFiles is enabled
+	// Check if file already exists when KeepDownloadedArchive is enabled
 	fileExists := false
 	fullPath := utils.ResolvePath(newVersionZipName)
 	if _, err := os.Stat(fullPath); err == nil {
 		fileExists = true
 	}
 
-	if KeepNupkgFiles && fileExists {
+	if KeepDownloadedArchive && fileExists {
 		fmt.Printf("Using existing file: %s\n", newVersionZipName)
 	} else {
 		// Download if file doesn't exist or if we're not keeping files
@@ -336,8 +342,8 @@ func downloadAndExtract(version, downloadURL string) error {
 	// Close the zip reader before attempting to delete temp file
 	zipReader.Close()
 
-	// Delete the archive file only if KeepNupkgFiles is false
-	if !KeepNupkgFiles {
+	// Delete the archive file only if KeepDownloadedArchive is false
+	if !KeepDownloadedArchive {
 		os.Remove(newVersionDownloadPath)
 	} else {
 		fmt.Printf("Keeping archive file: %s\n", newVersionZipName)

@@ -10,6 +10,15 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
+)
+
+const (
+	// patchLockName serializes the elevated patcher across concurrently-launched
+	// instances (all run as the same user in one session, so Local\ is shared).
+	patchLockName = `Local\ClaudeWebExtLauncher-Patch`
+	// patchLockTimeout is generous: a real patch downloads the ~222 MB MSIX.
+	patchLockTimeout = 5 * time.Minute
 )
 
 // prepareAdminContext cleans up old installation files from the launcher directory.
@@ -98,13 +107,36 @@ func runPatcherMode(forceUpdate bool, debug bool) int {
 
 // ensureClaudeReady checks whether admin work is needed and, if so, invokes
 // the launcher in elevated patcher mode via UAC.
+//
+// When a patch is actually needed, it is serialized behind a cross-process lock so
+// that launching many instances at once (e.g. a 10-instance batch template) can't
+// spawn 10 elevated patchers that race and corrupt the shared install. The first
+// instance patches (one UAC prompt); the rest block, then re-check and skip.
 func ensureClaudeReady(forceUpdate bool) error {
-	needsAdmin := checkNeedsAdmin(forceUpdate)
-
-	if !needsAdmin {
+	// Fast path: if nothing needs patching, don't take the lock — let the common
+	// case stay fully concurrent (this check is read-only + a version query).
+	if !checkNeedsAdmin(forceUpdate) {
 		fmt.Println("Claude is up to date, no admin work needed.")
 		return nil
 	}
+
+	// A patch is needed: serialize it.
+	lock, locked := utils.AcquirePatchLock(patchLockName, patchLockTimeout)
+	if locked {
+		defer lock.Release()
+		// Re-check under the lock — another instance may have just finished patching.
+		if !checkNeedsAdmin(forceUpdate) {
+			fmt.Println("Claude was patched by another instance; continuing.")
+			return nil
+		}
+	} else if claudeInstalled() {
+		// Waited past the timeout for another instance. The atomic staging-swap
+		// guarantees the install is never left stock/half-written, so launching
+		// whatever is present is safe.
+		fmt.Println("Warning: timed out waiting for another instance to finish patching; launching existing installation.")
+		return nil
+	}
+	// If we couldn't lock AND there's no install yet, fall through and patch anyway.
 
 	exe, err := os.Executable()
 	if err != nil {
