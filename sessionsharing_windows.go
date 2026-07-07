@@ -3,6 +3,7 @@
 package main
 
 import (
+	"claude-webext-patcher/utils"
 	"fmt"
 	"io"
 	"io/fs"
@@ -11,6 +12,14 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+)
+
+const (
+	// sessionLockName serializes session-folder mutations across concurrently-launched
+	// instances so the shared official install isn't repaired/junctioned by two processes at
+	// once. Independent of the patch lock, which is already released by this point.
+	sessionLockName    = `Local\ClaudeWebExtLauncher-Sessions`
+	sessionLockTimeout = 2 * time.Minute
 )
 
 // sharedSessionFolders are the userData subfolders that hold self-contained session
@@ -32,10 +41,24 @@ var sharedSessionFolders = []string{
 // merged into the store (newer-mtime wins) and each original folder is backed up before
 // being replaced by a junction. Runs unelevated and is fully idempotent.
 func SetupSessionSharing(instanceName string) {
+	// Only the default instance shares sessions with the official install. Named instances
+	// stay isolated (RepairSessionSharing keeps them that way), so the single global store is
+	// only ever linked by {official, Claude-<default>}.
+	if instanceName != defaultInstanceName {
+		return
+	}
+
 	appData := os.Getenv("APPDATA")
 	if appData == "" {
 		return
 	}
+
+	lock, locked := utils.AcquirePatchLock(sessionLockName, sessionLockTimeout)
+	if !locked {
+		fmt.Println("Warning: timed out waiting to set up shared sessions; skipping this launch.")
+		return
+	}
+	defer lock.Release()
 
 	neutralRoot := filepath.Join(appData, "ClaudeWebExtLauncher", "shared-sessions")
 
@@ -60,6 +83,85 @@ func SetupSessionSharing(instanceName string) {
 			}
 		}
 	}
+}
+
+// RepairSessionSharing undoes the global session pooling created by older builds, which
+// junctioned every instance's Cowork/Code session folders (and the official install's) into
+// one shared store regardless of instance. It restores the launching named instance's folders
+// to real directories, and — only when the default instance is not actively sharing — the
+// official install's folders too (otherwise those junctions are legitimate). The default
+// instance itself is left alone, since it is meant to be junctioned.
+func RepairSessionSharing(instanceName string) {
+	if instanceName == defaultInstanceName {
+		return
+	}
+
+	appData := os.Getenv("APPDATA")
+	if appData == "" {
+		return
+	}
+
+	lock, locked := utils.AcquirePatchLock(sessionLockName, sessionLockTimeout)
+	if !locked {
+		fmt.Println("Warning: timed out waiting to repair session folders; skipping this launch.")
+		return
+	}
+	defer lock.Release()
+
+	restoredAny := false
+
+	// Restore this instance's own folders to real, isolated directories.
+	instanceRoot := filepath.Join(appData, "Claude-"+instanceName)
+	for _, folder := range sharedSessionFolders {
+		if restoreRealFolder(filepath.Join(instanceRoot, folder)) {
+			restoredAny = true
+		}
+	}
+
+	// The official install's junctions are orphaned leftovers unless the default instance is
+	// currently sharing with it; in that case they're correct, so leave them.
+	if !defaultInstanceIsSharing(appData) {
+		for _, folder := range sharedSessionFolders {
+			if restoreRealFolder(filepath.Join(appData, "Claude", folder)) {
+				restoredAny = true
+			}
+		}
+	}
+
+	if restoredAny {
+		fmt.Printf("Restored isolated Cowork/Code sessions for instance %q.\n", instanceName)
+	}
+}
+
+// restoreRealFolder converts link back into a real directory if it is currently a junction
+// left by older global session-sharing: it removes the reparse point and moves the
+// <link>.presync-backup folder back into place if present. Returns true if link was a junction
+// that we undid. It never deletes the shared store the junction pointed at.
+func restoreRealFolder(link string) bool {
+	if _, err := os.Readlink(link); err != nil {
+		return false // not a junction (or doesn't exist) — leave it alone
+	}
+	// os.Remove on a directory junction removes only the reparse point, not the target.
+	if err := os.Remove(link); err != nil {
+		fmt.Printf("Warning: could not remove session junction %s: %v\n", link, err)
+		return false
+	}
+	backup := link + ".presync-backup"
+	if _, err := os.Stat(backup); err == nil {
+		if err := os.Rename(backup, link); err != nil {
+			fmt.Printf("Warning: could not restore %s from backup: %v\n", link, err)
+		}
+	}
+	// No backup: the folder had no pre-existing data; Claude recreates it as needed.
+	return true
+}
+
+// defaultInstanceIsSharing reports whether the default instance is currently set up to share
+// with the official install (its Cowork session folder is a junction).
+func defaultInstanceIsSharing(appData string) bool {
+	link := filepath.Join(appData, "Claude-"+defaultInstanceName, sharedSessionFolders[0])
+	_, err := os.Readlink(link)
+	return err == nil
 }
 
 // CleanupOfficialJunctions removes the session junctions under %APPDATA%\Claude (the link

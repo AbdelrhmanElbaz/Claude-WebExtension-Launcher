@@ -15,10 +15,15 @@ var launchClaudeInTerminal = false
 // Version is the current version of the application
 const Version = "3.3.0"
 
+// defaultInstanceName is the instance used when --instance is not given. Only this
+// instance shares Cowork/Code sessions with the official install; named instances stay
+// isolated (see SetupSessionSharing / RepairSessionSharing).
+const defaultInstanceName = "modified"
+
 func main() {
 	// Parse command-line flags
 	forceUpdate := flag.Bool("force-update", false, "Force update to the latest version even if it's not verified compatible")
-	instanceName := flag.String("instance", "modified", "Instance name for separate data directory and lock")
+	instanceName := flag.String("instance", defaultInstanceName, "Instance name for separate data directory and lock")
 	patcherMode := flag.Bool("patcher", false, "Run in elevated patcher mode (internal)")
 	debug := flag.Bool("debug", false, "Keep console windows open and launch Claude attached to terminal")
 	flag.Parse()
@@ -72,8 +77,10 @@ func main() {
 	// Release any platform-specific privileges before launching Claude
 	releaseAdminContext()
 
-	// Share Cowork/Code sessions between the official and patched installs via junctions
-	// into a neutral store, before any uninstall prompt (Windows only)
+	// Reconcile Cowork/Code session sharing before any uninstall prompt (Windows only):
+	// repair a named instance that was wrongly pooled by an older build, then (only for the
+	// default instance) share with the official install via junctions into a neutral store.
+	RepairSessionSharing(*instanceName)
 	SetupSessionSharing(*instanceName)
 
 	// Check for official Claude MSIX installation (Windows only)
