@@ -13,7 +13,7 @@ import (
 var launchClaudeInTerminal = false
 
 // Version is the current version of the application
-const Version = "3.3.0"
+const Version = "3.3.1"
 
 // defaultInstanceName is the instance used when --instance is not given. Only this
 // instance shares Cowork/Code sessions with the official install; named instances stay

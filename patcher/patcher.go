@@ -53,7 +53,10 @@ type MacOSManifest struct {
 type Patch struct {
 	Files   []string
 	Exclude []string
-	Func    func(content []byte) []byte
+	// Func returns the (possibly modified) content and whether it actually
+	// changed anything. A false modified return means "not applicable to this
+	// file" — the caller keeps looking through the remaining matched files.
+	Func func(content []byte) (result []byte, modified bool)
 }
 
 var supportedVersions = map[string][]Patch{
@@ -169,15 +172,18 @@ func DeploySentinelExtension() error {
 
 // patchProtocolArray adds "chrome-extension:" to the allowed protocols array.
 // Matches the prefix ["devtools:","file:" and inserts before the closing ].
-func patchProtocolArray(content []byte) []byte {
+//
+// Claude's bundle is heavily code-split, so this runs against many chunk files
+// and only one contains the array. "Prefix not found" is therefore the normal
+// case for most files and is reported as (content, false) without any warning —
+// the caller decides whether a genuine failure occurred (no chunk matched).
+func patchProtocolArray(content []byte) ([]byte, bool) {
 	contentStr := string(content)
 
 	prefix := `["devtools:","file:"`
 	idx := strings.Index(contentStr, prefix)
 	if idx == -1 {
-		fmt.Println("Warning: Could not find protocol array prefix in bundle")
-		debugPause()
-		return content
+		return content, false
 	}
 
 	// Find the closing ] after the prefix
@@ -185,7 +191,7 @@ func patchProtocolArray(content []byte) []byte {
 	if closingIdx == -1 {
 		fmt.Println("Warning: Could not find closing ] for protocol array")
 		debugPause()
-		return content
+		return content, false
 	}
 	closingIdx += idx
 
@@ -193,13 +199,13 @@ func patchProtocolArray(content []byte) []byte {
 	arrayContent := contentStr[idx : closingIdx+1]
 	if strings.Contains(arrayContent, "chrome-extension:") {
 		fmt.Println("Protocol array already contains chrome-extension:, skipping")
-		return content
+		return content, false
 	}
 
 	// Insert ,"chrome-extension:" before the ]
 	contentStr = contentStr[:closingIdx] + `,"chrome-extension:"` + contentStr[closingIdx:]
 	fmt.Println("Added chrome-extension: to protocol array")
-	return []byte(contentStr)
+	return []byte(contentStr), true
 }
 
 // installWrapper copies the wrapper.js into the unpacked asar and redirects
@@ -477,7 +483,6 @@ func applyPatches(version string) error {
 				}
 
 				relPath, _ := filepath.Rel(tempDir, matchedFile)
-				fmt.Printf("Patching %s\n", relPath)
 
 				content, err := os.ReadFile(matchedFile)
 				if err != nil {
@@ -485,12 +490,18 @@ func applyPatches(version string) error {
 					continue
 				}
 
-				newContent := patch.Func(content)
+				newContent, modified := patch.Func(content)
+				if !modified {
+					continue
+				}
+
+				fmt.Printf("Patched %s\n", relPath)
 				if err := os.WriteFile(matchedFile, newContent, 0644); err != nil {
 					fmt.Printf("  Failed to write %s: %v\n", relPath, err)
 					continue
 				}
 				patchApplied = true
+				break
 			}
 
 			if patchApplied {
