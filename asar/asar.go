@@ -14,6 +14,10 @@
 //
 // File contents begin at offset 8+word1 (== 16+align4(jsonLen)). Each file's
 // "offset" in the index is a decimal string relative to that content base.
+//
+// Electron's asar integrity check hashes the JSON index as stored in the pickle —
+// exactly word3 bytes, EXCLUDING the alignment padding that follows it. See
+// HeaderHash.
 package asar
 
 import (
@@ -93,6 +97,43 @@ func Extract(asarPath, destDir string) error {
 		return err
 	}
 	return extractEntry(&root, f, contentBase, destDir, destDir, unpackedDir)
+}
+
+// HeaderHash returns the lowercase-hex SHA256 of the archive's JSON index, which is
+// the value Electron's asar integrity check compares against — the
+// ElectronAsarIntegrity entry in Info.plist on macOS, and a string embedded in the
+// exe on Windows.
+//
+// Electron hashes the index exactly as stored in the pickle: the jsonLen bytes
+// following the 16-byte header, EXCLUDING the alignment padding Pack writes after
+// them.
+func HeaderHash(asarPath string) (string, error) {
+	f, err := os.Open(asarPath)
+	if err != nil {
+		return "", fmt.Errorf("opening asar: %w", err)
+	}
+	defer f.Close()
+
+	var header [16]byte
+	if _, err := io.ReadFull(f, header[:]); err != nil {
+		return "", fmt.Errorf("reading asar header: %w", err)
+	}
+	if word0 := binary.LittleEndian.Uint32(header[0:4]); word0 != 4 {
+		return "", fmt.Errorf("invalid asar header (word0=%d, expected 4)", word0)
+	}
+	jsonLen := int64(binary.LittleEndian.Uint32(header[12:16]))
+	if jsonLen == 0 {
+		return "", fmt.Errorf("invalid asar header (empty index)")
+	}
+	if fi, err := f.Stat(); err == nil && 16+jsonLen > fi.Size() {
+		return "", fmt.Errorf("asar index length %d exceeds file size %d", jsonLen, fi.Size())
+	}
+
+	h := sha256.New()
+	if _, err := io.CopyN(h, f, jsonLen); err != nil {
+		return "", fmt.Errorf("reading asar index: %w", err)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func extractEntry(e *entry, archive *os.File, contentBase int64, destDir, curDir, unpackedDir string) error {

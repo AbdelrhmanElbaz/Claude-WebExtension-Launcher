@@ -37,7 +37,7 @@ const (
 	macosReleasesURL          = "https://downloads.claude.ai/releases/darwin/universal/RELEASES.json"
 	appFolderName             = "app-latest"
 	KeepDownloadedArchive     = false
-	PatchVersion              = "9"
+	PatchVersion              = "10"
 )
 
 type MacOSManifest struct {

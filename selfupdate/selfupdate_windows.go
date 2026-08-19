@@ -37,9 +37,12 @@ func finishUpdateIfNeeded(exePath string) {
 			os.Exit(1)
 		}
 
-		// Launch the original in new console window
+		// Launch the original in new console window, forwarding our own arguments so
+		// flags like --instance survive the restart instead of silently falling back
+		// to the default instance.
 		// Need to quote the path for cmd /c start to handle spaces
-		cmd := exec.Command("cmd", "/c", "start", "Claude Desktop (Extended)", originalExe)
+		startArgs := append([]string{"/c", "start", "Claude Desktop (Extended)", originalExe}, os.Args[1:]...)
+		cmd := exec.Command("cmd", startArgs...)
 		cmd.Start()
 
 		os.Exit(0)
@@ -125,9 +128,10 @@ func installUpdate(tempDir, tempZip string) error {
 
 	fmt.Println("Restarting to complete update...")
 
-	// Launch the new exe
+	// Launch the new exe, forwarding our own arguments so flags like --instance
+	// survive the update restart.
 	newExeName := filepath.Join(appDir, strings.TrimSuffix(executableName, ".exe")+".new.exe")
-	cmd := exec.Command(newExeName)
+	cmd := exec.Command(newExeName, os.Args[1:]...)
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start updated executable: %v", err)
 	}

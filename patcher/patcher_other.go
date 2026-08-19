@@ -4,15 +4,17 @@ package patcher
 
 import (
 	"archive/zip"
-	"bytes"
+	"claude-webext-patcher/asar"
 	"claude-webext-patcher/utils"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -41,65 +43,110 @@ func CoworkServiceExists() bool {
 }
 
 func finalizePatches() error {
-	// Ad-hoc sign on macOS after asar modifications
-	fmt.Println("Signing app with ad-hoc signature...")
-	appPath := filepath.Join(AppFolder, "Claude.app")
-
-	cmd := exec.Command("codesign", "--remove-signature", appPath)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		fmt.Printf("Remove signature output: %s\n", string(output))
-		// Ignore errors, might not be signed
-	} else if len(output) > 0 {
-		fmt.Printf("Remove signature output: %s\n", string(output))
+	// This file also builds for Linux, which has no Claude.app and no codesign.
+	if runtime.GOOS != "darwin" {
+		return nil
 	}
 
-	cmd = exec.Command("codesign", "--force", "--deep", "--sign", "-", appPath)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		fmt.Printf("Warning: Could not sign app: %v\n%s\n", err, string(output))
-		debugPause()
-	} else {
-		fmt.Printf("App signed successfully\n")
-		if len(output) > 0 {
-			fmt.Printf("Signing output: %s\n", string(output))
-		}
+	// Info.plist is covered by the code signature, so the integrity hash has to be
+	// final before signing.
+	if err := updateAsarIntegrity(); err != nil {
+		return err
 	}
+	return signApp(filepath.Join(AppFolder, "Claude.app"))
+}
 
-	// macOS: capture hash mismatch, patch Info.plist, re-sign
-	fmt.Println("Capturing hash mismatch...")
-	expectedHash, actualHash, err := captureHashMismatch()
+// updateAsarIntegrity records the repacked app.asar's header hash in Info.plist, which
+// is where Electron reads the expected value from on macOS.
+//
+// Every failure here is fatal. A wrong value makes Electron abort with "Integrity check
+// failed" on every single launch (issue #38), so a bundle with an unverified hash must
+// never reach swapAppFolder — erroring out leaves the previous working install in place.
+func updateAsarIntegrity() error {
+	newHash, err := asar.HeaderHash(filepath.Join(appResourcesDir, "app.asar"))
 	if err != nil {
-		return fmt.Errorf("capturing hash: %v", err)
+		return fmt.Errorf("computing asar header hash: %v", err)
+	}
+	if !isHexHash(newHash) {
+		return fmt.Errorf("computed asar header hash %q is not a 64-character lowercase hex digest", newHash)
 	}
 
-	fmt.Printf("Expected hash: %s\n", expectedHash)
-	fmt.Printf("Actual hash: %s\n", actualHash)
+	plistPath := filepath.Join(AppFolder, "Claude.app", "Contents", "Info.plist")
 
-	fmt.Println("Patching exe...")
-	if err := replaceHashInExe(expectedHash, actualHash); err != nil {
-		return fmt.Errorf("patching exe: %v", err)
+	oldHash, viaPlistBuddy, err := readAsarIntegrityHash(plistPath)
+	if err != nil {
+		return err
+	}
+	if oldHash == newHash {
+		// Re-patching an unchanged asar; nothing to do.
+		fmt.Printf("Asar integrity hash already correct (%s)\n", newHash)
+		return nil
 	}
 
-	// Ad-hoc sign on macOS after all modifications
+	fmt.Printf("Asar integrity hash: %s -> %s\n", oldHash, newHash)
+	if viaPlistBuddy {
+		err = plistBuddySetAsarHash(plistPath, newHash)
+	} else {
+		err = writePlistAsarHash(plistPath, newHash)
+	}
+	if err != nil {
+		return err
+	}
+
+	// Read it back rather than trusting the write.
+	got, _, err := readAsarIntegrityHash(plistPath)
+	if err != nil {
+		return fmt.Errorf("verifying Info.plist: %v", err)
+	}
+	if got != newHash {
+		return fmt.Errorf("Info.plist asar integrity hash is %q after update, expected %q", got, newHash)
+	}
+
+	fmt.Println("Info.plist asar integrity hash updated")
+	return nil
+}
+
+// readAsarIntegrityHash reads the current integrity hash, preferring the pure-Go XML
+// path. Claude ships an XML Info.plist today; PlistBuddy is the fallback for the day
+// that stops being true, so a format change costs us a slower path rather than a
+// broken macOS build.
+func readAsarIntegrityHash(plistPath string) (hash string, viaPlistBuddy bool, err error) {
+	hash, err = readPlistAsarHash(plistPath)
+	if err == nil {
+		return hash, false, nil
+	}
+	if !errors.Is(err, errPlistHashNotFound) {
+		return "", false, err
+	}
+
+	fmt.Println("Info.plist is not in the expected XML layout, falling back to PlistBuddy...")
+	hash, buddyErr := plistBuddyGetAsarHash(plistPath)
+	if buddyErr != nil {
+		return "", true, fmt.Errorf("%v; %v", err, buddyErr)
+	}
+	return hash, true, nil
+}
+
+// signApp ad-hoc re-signs the bundle. Patching app.asar and Info.plist invalidates
+// Claude's original signature, and macOS will not execute a bundle whose signature does
+// not match, so a signing failure means an unlaunchable app and is fatal.
+func signApp(appPath string) error {
 	fmt.Println("Signing app with ad-hoc signature...")
 
-	cmd = exec.Command("codesign", "--remove-signature", appPath)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		fmt.Printf("Remove signature output: %s\n", string(output))
-	} else if len(output) > 0 {
-		fmt.Printf("Remove signature output: %s\n", string(output))
+	// An unsigned or already-stripped bundle is fine here, so ignore failures.
+	if output, err := exec.Command("codesign", "--remove-signature", appPath).CombinedOutput(); err != nil || len(output) > 0 {
+		fmt.Printf("Remove signature output: %s\n", strings.TrimSpace(string(output)))
 	}
 
-	cmd = exec.Command("codesign", "--force", "--deep", "--sign", "-", appPath)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		fmt.Printf("Warning: Could not sign app: %v\n%s\n", err, string(output))
+	output, err := exec.Command("codesign", "--force", "--deep", "--sign", "-", appPath).CombinedOutput()
+	if err != nil {
 		debugPause()
-	} else {
-		fmt.Printf("App signed successfully\n")
-		if len(output) > 0 {
-			fmt.Printf("Signing output: %s\n", string(output))
-		}
+		return fmt.Errorf("ad-hoc signing %s: %v\n%s", appPath, err, string(output))
 	}
-
+	fmt.Println("App signed successfully")
+	if len(output) > 0 {
+		fmt.Printf("Signing output: %s\n", string(output))
+	}
 	return nil
 }
 
@@ -328,46 +375,32 @@ func downloadAndExtract(version, downloadURL string) error {
 	return nil
 }
 
-func captureHashMismatch() (string, string, error) {
-	cmd := exec.Command(appExePath)
-	output, _ := cmd.CombinedOutput()
+// plistBuddyPath is macOS's built-in plist editor. Unlike the XML splice it goes
+// through CFPropertyList, so it reads and writes binary plists too.
+const plistBuddyPath = "/usr/libexec/PlistBuddy"
 
-	// Parse the error output for the hashes
-	// Looking for pattern: "Integrity check failed for asar archive (EXPECTED vs ACTUAL)"
-	outputStr := string(output)
-	fmt.Println(outputStr)
-	if strings.Contains(outputStr, "Integrity check failed") {
-		// Extract the hashes using a simple string parse
-		start := strings.Index(outputStr, "(")
-		end := strings.Index(outputStr, ")")
-		if start != -1 && end != -1 {
-			hashPart := outputStr[start+1 : end]
-			parts := strings.Split(hashPart, " vs ")
-			if len(parts) == 2 {
-				return parts[0], parts[1], nil
-			}
-		}
+// asarIntegrityKeyPath addresses the hash in PlistBuddy's ":"-separated syntax. The key
+// is literally "Resources/app.asar" — the dot is why plutil, whose key paths are
+// dot-separated, is not used here.
+const asarIntegrityKeyPath = ":ElectronAsarIntegrity:Resources/app.asar:hash"
+
+func plistBuddyGetAsarHash(plistPath string) (string, error) {
+	output, err := exec.Command(plistBuddyPath, "-c", "Print "+asarIntegrityKeyPath, plistPath).CombinedOutput()
+	value := strings.TrimSpace(string(output))
+	// PlistBuddy exits 0 on some -c errors, so the message matters as much as the code.
+	if err != nil || value == "" || strings.Contains(value, "Does Not Exist") {
+		return "", fmt.Errorf("PlistBuddy could not read %s from %s: %v (%s)", asarIntegrityKeyPath, plistPath, err, value)
 	}
-
-	return "", "", fmt.Errorf("could not parse hash mismatch")
+	return value, nil
 }
 
-func replaceHashInExe(oldHash, newHash string) error {
-	// On macOS, the hash is in Info.plist
-	plistPath := filepath.Join(AppFolder, "Claude.app", "Contents", "Info.plist")
-
-	// Read the plist
-	data, err := os.ReadFile(plistPath)
+func plistBuddySetAsarHash(plistPath, newHash string) error {
+	output, err := exec.Command(plistBuddyPath,
+		"-c", "Set "+asarIntegrityKeyPath+" "+newHash,
+		"-c", "Save",
+		plistPath).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("reading Info.plist: %v", err)
+		return fmt.Errorf("PlistBuddy could not set %s: %v (%s)", asarIntegrityKeyPath, err, strings.TrimSpace(string(output)))
 	}
-
-	// Replace the hash
-	replaced := bytes.Replace(data, []byte(oldHash), []byte(newHash), 1)
-	if bytes.Equal(replaced, data) {
-		return fmt.Errorf("hash not found in Info.plist")
-	}
-
-	// Write back
-	return os.WriteFile(plistPath, replaced, 0644)
+	return nil
 }
