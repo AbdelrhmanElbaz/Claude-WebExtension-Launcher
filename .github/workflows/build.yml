@@ -39,9 +39,8 @@ jobs:
         with:
           name: windows-build
           path: |
-            *.exe
-            build/**
-            dist/**
+            builds/*.exe
+            builds/*.zip
           if-no-files-found: warn
 
   build-macos:
@@ -71,4 +70,5 @@ jobs:
             *.app
             build/**
             dist/**
+            builds/**
           if-no-files-found: warn
