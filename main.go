@@ -1,8 +1,10 @@
 package main
 
 import (
+	"claude-webext-patcher/appconfig"
 	"claude-webext-patcher/patcher"
 	"claude-webext-patcher/selfupdate"
+	"claude-webext-patcher/ui"
 	"flag"
 	"fmt"
 	"os"
@@ -21,12 +23,54 @@ const Version = "3.3.3"
 const defaultInstanceName = "modified"
 
 func main() {
-	// Parse command-line flags
-	forceUpdate := flag.Bool("force-update", false, "Force update to the latest version even if it's not verified compatible")
-	instanceName := flag.String("instance", defaultInstanceName, "Instance name for separate data directory and lock")
+	// Parse command-line flags. Flags still work for scripting/shortcuts and
+	// always override whatever is in launcher-config.json / the picker.
+	forceUpdateFlag := flag.Bool("force-update", false, "Force update to the latest version even if it's not verified compatible")
+	instanceFlag := flag.String("instance", "", "Instance name for separate data directory and lock (skips the picker window)")
 	patcherMode := flag.Bool("patcher", false, "Run in elevated patcher mode (internal)")
-	debug := flag.Bool("debug", false, "Keep console windows open and launch Claude attached to terminal")
+	debugFlag := flag.Bool("debug", false, "Keep console windows open and launch Claude attached to terminal")
+	managerMode := flag.Bool("manage", false, "Force-show the instance picker window even if 'show on startup' is off")
 	flag.Parse()
+
+	// Patcher mode has no config/UI dependency and must stay minimal - handled first.
+	if *patcherMode {
+		patcher.EmbeddedFS = EmbeddedFS
+		patcher.Debug = *debugFlag
+		os.Exit(runPatcherMode(*forceUpdateFlag, *debugFlag))
+	}
+
+	cfg, err := appconfig.Load()
+	if err != nil {
+		fmt.Printf("Warning: failed to load launcher-config.json, using defaults: %v\n", err)
+	}
+
+	var instanceName *string
+	switch {
+	case *instanceFlag != "":
+		// Explicit --instance always wins and never shows the picker.
+		instanceName = instanceFlag
+		cfg.LastUsedInstance = *instanceName
+		cfg.AddInstance(*instanceName)
+		_ = cfg.Save()
+	case *managerMode || cfg.ShowPickerOnStartup || cfg.LastUsedInstance == "":
+		pick := ui.ShowPicker(cfg)
+		if pick.Cancelled {
+			fmt.Println("No instance selected, exiting.")
+			os.Exit(0)
+		}
+		instanceName = &pick.InstanceName
+	default:
+		instanceName = &cfg.LastUsedInstance
+	}
+
+	forceUpdate := forceUpdateFlag
+	if *forceUpdate == false {
+		*forceUpdate = cfg.ForceUpdate
+	}
+	debug := debugFlag
+	if *debug == false {
+		*debug = cfg.DebugMode
+	}
 
 	launchClaudeInTerminal = *debug
 
@@ -37,11 +81,6 @@ func main() {
 	// Set embedded FS and debug flag for patcher module
 	patcher.EmbeddedFS = EmbeddedFS
 	patcher.Debug = *debug
-
-	// Patcher mode: do admin work and exit (Windows only)
-	if *patcherMode {
-		os.Exit(runPatcherMode(*forceUpdate, *debug))
-	}
 
 	// Handle update completion first
 	selfupdate.FinishUpdateIfNeeded()
@@ -55,10 +94,16 @@ func main() {
 	fmt.Println("Claude WebExtension Launcher starting...")
 	fmt.Printf("Version: %s\n", Version)
 
-	// Check for self-updates
-	if err := selfupdate.CheckAndUpdate(); err != nil {
-		fmt.Printf("Update check failed: %v\n", err)
-		// Continue anyway
+	// Check for self-updates (can be turned off from Settings -> "Automatically
+	// check for launcher updates on startup", or overridden per-run with --manage
+	// if you just want the picker without forcing an update check).
+	if cfg.AutoUpdate {
+		if err := selfupdate.CheckAndUpdate(); err != nil {
+			fmt.Printf("Update check failed: %v\n", err)
+			// Continue anyway
+		}
+	} else {
+		fmt.Println("Skipping self-update check (disabled in Settings)")
 	}
 
 	// Ensure Claude is patched and extensions are up-to-date.
