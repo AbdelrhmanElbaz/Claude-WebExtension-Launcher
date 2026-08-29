@@ -79,7 +79,13 @@ func ShowPicker(cfg *appconfig.Config) PickResult {
 		btn := widget.NewButton("", func() { chooseInstance(name) })
 		btn.Importance = widget.LowImportance
 
-		return container.NewStack(card, btn)
+		// btn must be BELOW card in the stack: it's a transparent full-card
+		// hit target for "select this instance", but card (on top) still
+		// contains its own tappable menuBtn. Fyne hit-tests top-down, so
+		// menuBtn (topmost at its position) gets the click instead of being
+		// swallowed by btn, and card's opaque background stops btn's hover
+		// highlight from showing through and hiding the icon/label.
+		return container.NewStack(btn, card)
 	}
 
 	makeAddCard := func() fyne.CanvasObject {
