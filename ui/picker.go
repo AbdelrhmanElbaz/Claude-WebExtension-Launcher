@@ -220,12 +220,16 @@ func ShowPicker(cfg *appconfig.Config) PickResult {
 		"Pick an instance, or add a new one. Each instance keeps its own extensions, data and notes.",
 		fyne.TextAlignCenter, fyne.TextStyle{})
 	subtitle.Wrapping = fyne.TextWrapWord
+	// Fyne quirk: a wrapping Label placed inside container.NewCenter (or any
+	// layout that sizes to MinSize) collapses to ~1 character of width and
+	// renders vertically. Force a fixed, generous width so it wraps normally.
+	subtitleBox := container.New(layout.NewGridWrapLayout(fyne.NewSize(700, 40)), subtitle)
 
 	refreshBtn := widget.NewButtonWithIcon("", theme.ViewRefreshIcon(), rebuildCards)
 	refreshBtn.Importance = widget.LowImportance
 
 	headerRow := container.NewBorder(nil, nil, nil, refreshBtn,
-		container.NewVBox(container.NewCenter(title), container.NewCenter(subtitle)))
+		container.NewVBox(container.NewCenter(title), container.NewCenter(subtitleBox)))
 
 	showOnStartup := widget.NewCheck("Show on startup", func(checked bool) {
 		cfg.ShowPickerOnStartup = checked
