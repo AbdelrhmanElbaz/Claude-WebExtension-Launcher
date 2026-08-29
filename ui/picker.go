@@ -147,11 +147,13 @@ func ShowPicker(cfg *appconfig.Config) PickResult {
 
 	bottomBar := container.NewBorder(nil, nil, showOnStartup, settingsBtn)
 
+	cardsScroll := container.NewVScroll(cardsBox)
+
 	content := container.NewBorder(
 		container.NewVBox(container.NewCenter(title), container.NewCenter(subtitleBox), widget.NewSeparator()),
 		bottomBar,
 		nil, nil,
-		container.NewCenter(cardsBox),
+		cardsScroll,
 	)
 
 	w.SetContent(container.NewPadded(content))
