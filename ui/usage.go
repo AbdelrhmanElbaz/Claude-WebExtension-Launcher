@@ -1,10 +1,15 @@
-// Package ui — usage.go reads each instance's plan-usage-history.json
-// (written by Claude Desktop itself, NOT by us) to surface two numbers in
-// the picker: the 5-hour rolling usage % ("fh") and the weekly/session
-// usage % ("sd"), plus a "last active" timestamp taken from the newest
-// sample in the file.
+// Package ui — usage.go surfaces two numbers in the picker for each
+// instance: the 5-hour rolling usage % ("fh") and the weekly/session usage
+// % ("sd"), plus a "last active" timestamp. See usage_storage.go for the
+// primary (live) data source — chrome.storage.local, read straight from the
+// Usage Tracker extension's LevelDB. This file also keeps the *old* reader
+// as a fallback: plan-usage-history.json, written by Claude Desktop itself
+// (NOT by us, and NOT by the extension) via a separate Settings→Usage
+// mechanism. That file has been unreliable for everyone since ~Aug 22 2026,
+// which is what sent us looking for the extension-storage route in the
+// first place — it isn't something fixable from our side of the JSON.
 //
-// File shape on disk (%APPDATA%\Claude-<instance>\plan-usage-history.json):
+// Legacy file shape on disk (%APPDATA%\Claude-<instance>\plan-usage-history.json):
 //
 //	{
 //	  "version": 2,
@@ -90,20 +95,38 @@ func instanceUserDataDir(instance string) string {
 	return filepath.Join(os.Getenv("APPDATA"), "Claude-"+instance)
 }
 
-// ReadInstanceUsage loads and parses plan-usage-history.json for one
-// instance. A missing file (instance never launched) is not an error — it
-// just yields a zero-value InstanceUsage with both Has* flags false.
-func ReadInstanceUsage(instanceName string) InstanceUsage {
-	var out InstanceUsage
-
+// readUsageFromLegacyFile is the original reader, kept as a fallback. See
+// the package-level comment above and usage_storage.go for why this is no
+// longer the primary source.
+func readUsageFromLegacyFile(instanceName string) (rawUsageFile, bool) {
 	p := filepath.Join(instanceUserDataDir(instanceName), "plan-usage-history.json")
 	data, err := os.ReadFile(p)
 	if err != nil {
-		return out // missing/unreadable — render as "no data" in the UI
+		return rawUsageFile{}, false
 	}
 
 	var f rawUsageFile
 	if err := json.Unmarshal(data, &f); err != nil || len(f.Samples) == 0 {
+		return rawUsageFile{}, false
+	}
+	return f, true
+}
+
+// ReadInstanceUsage returns one instance's usage row. It reads the
+// extension's own chrome.storage.local (via usage_storage.go) as the
+// primary source, since that's what actually feeds the live 5h/7d numbers
+// shown inside Claude — plan-usage-history.json is written by a separate
+// Anthropic-side mechanism and has been unreliable since ~Aug 22 2026, so it
+// is now only a fallback for the (rare) case the extension storage can't be
+// read at all, e.g. right after a fresh install before it's written anything.
+func ReadInstanceUsage(instanceName string) InstanceUsage {
+	var out InstanceUsage
+
+	f, ok := readUsageFromExtensionStorage(instanceName)
+	if !ok {
+		f, ok = readUsageFromLegacyFile(instanceName)
+	}
+	if !ok || len(f.Samples) == 0 {
 		return out
 	}
 
