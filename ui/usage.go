@@ -46,12 +46,12 @@ type InstanceUsage struct {
 	// LastActive is the timestamp of the newest sample in the file,
 	// regardless of whether it carried usage numbers. Zero value means we
 	// have no data at all (file missing / instance never launched).
-	LastActive time.Time
+	LastActive  time.Time
 	HasActivity bool
 }
 
 type usageSample struct {
-	T   int64 `json:"t"` // epoch milliseconds
+	T   int64  `json:"t"` // epoch milliseconds
 	Org string `json:"org"`
 	U   struct {
 		FH int `json:"fh"`
@@ -112,32 +112,46 @@ func readUsageFromLegacyFile(instanceName string) (rawUsageFile, bool) {
 	return f, true
 }
 
-// ReadInstanceUsage returns one instance's usage row. It reads the
-// extension's own chrome.storage.local (via usage_storage.go) as the
-// primary source, since that's what actually feeds the live 5h/7d numbers
-// shown inside Claude — plan-usage-history.json is written by a separate
-// Anthropic-side mechanism and has been unreliable since ~Aug 22 2026, so it
-// is now only a fallback for the (rare) case the extension storage can't be
-// read at all, e.g. right after a fresh install before it's written anything.
+// ReadInstanceUsage returns one instance's usage row, combining two
+// independent sources that each answer a different question:
+//
+//   - The 5h/7d PERCENTAGES come from usage-live.json (see usage_live.go) —
+//     a real live reading, fetched by wrapper.js from the same API endpoint
+//     the extension itself calls, using that instance's own claude.ai
+//     session. This is polled periodically (every few minutes) by
+//     wrapper.js regardless of whether the user is actually doing anything,
+//     so its own fetch timestamp is a poor proxy for "last active".
+//   - The LAST-ACTIVE timestamp still comes from plan-usage-history.json,
+//     written by Claude Desktop itself only when the user actually does
+//     something — that's genuine activity, unlike our fixed-interval poll.
+//
+// If usage-live.json is missing entirely (e.g. instance never launched
+// under a build that writes it yet), we fall back to the percentages baked
+// into plan-usage-history.json too, same as before this file existed.
 func ReadInstanceUsage(instanceName string) InstanceUsage {
 	var out InstanceUsage
 
-	f, ok := readUsageFromExtensionStorage(instanceName)
-	if !ok {
-		f, ok = readUsageFromLegacyFile(instanceName)
+	legacy, hasLegacy := readUsageFromLegacyFile(instanceName)
+	if hasLegacy && len(legacy.Samples) > 0 {
+		last := legacy.Samples[len(legacy.Samples)-1]
+		out.LastActive = time.UnixMilli(last.T)
+		out.HasActivity = true
 	}
-	if !ok || len(f.Samples) == 0 {
+
+	if _, fh, sd, ok := readLiveUsageFile(instanceName); ok {
+		out.FiveHourPct = fh
+		out.WeeklyPct = sd
+		out.HasUsage = true
 		return out
 	}
 
-	// Last sample overall -> "last active", walking backwards.
-	last := f.Samples[len(f.Samples)-1]
-	out.LastActive = time.UnixMilli(last.T)
-	out.HasActivity = true
-
-	// Walk backwards for the most recent sample with non-empty "u".
-	for i := len(f.Samples) - 1; i >= 0; i-- {
-		s := f.Samples[i]
+	// No live reading yet — fall back to whatever plan-usage-history.json
+	// last recorded, walking backwards for the most recent non-empty "u".
+	if !hasLegacy {
+		return out
+	}
+	for i := len(legacy.Samples) - 1; i >= 0; i-- {
+		s := legacy.Samples[i]
 		if !sampleHasUsage(s.U) {
 			continue
 		}
