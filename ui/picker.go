@@ -124,8 +124,10 @@ func ShowPicker(cfg *appconfig.Config) PickResult {
 
 	title := widget.NewLabelWithStyle("Who's launching Claude?", fyne.TextAlignCenter,
 		fyne.TextStyle{Bold: true})
-	subtitle := widget.NewLabel("Pick an instance, or add a new one. Each instance keeps its own extensions and data.")
+	subtitle := widget.NewLabelWithStyle("Pick an instance, or add a new one. Each instance keeps its own extensions and data.",
+		fyne.TextAlignCenter, fyne.TextStyle{})
 	subtitle.Wrapping = fyne.TextWrapWord
+	subtitleBox := container.New(layout.NewGridWrapLayout(fyne.NewSize(560, 40)), subtitle)
 
 	showOnStartup := widget.NewCheck("Show on startup", func(checked bool) {
 		cfg.ShowPickerOnStartup = checked
@@ -140,7 +142,7 @@ func ShowPicker(cfg *appconfig.Config) PickResult {
 	bottomBar := container.NewBorder(nil, nil, showOnStartup, settingsBtn)
 
 	content := container.NewBorder(
-		container.NewVBox(container.NewCenter(title), container.NewCenter(subtitle), widget.NewSeparator()),
+		container.NewVBox(container.NewCenter(title), container.NewCenter(subtitleBox), widget.NewSeparator()),
 		bottomBar,
 		nil, nil,
 		container.NewCenter(cardsBox),
