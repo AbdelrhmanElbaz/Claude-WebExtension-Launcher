@@ -29,7 +29,12 @@ var (
 	colorUsageWarn   = color.NRGBA{R: 0xD9, G: 0x8C, B: 0x0D, A: 0xFF} // 60-89%
 	colorUsageHigh   = color.NRGBA{R: 0xDC, G: 0x26, B: 0x26, A: 0xFF} // >= 90%
 
-	cardMinSize  = fyne.NewSize(240, 220)
+	// Slightly larger than the card's actual content needs, to leave room
+	// for the container.NewPadded wrapper added around each card in
+	// rebuildCards (that padding is what creates the visible gap between
+	// cards in the GridWrapLayout, at the cost of a bit of cell size).
+	cardMinSize  = fyne.NewSize(256, 236)
+	cardBottomGap = float32(20) // margin below the last row of cards
 	usageRefresh = time.Minute
 )
 
@@ -204,10 +209,14 @@ func ShowPicker(cfg *appconfig.Config) PickResult {
 	rebuildCards = func() {
 		notes = loadNotes() // pick up anything saved from a just-closed note editor
 		cardsBox.Objects = nil
+		// Each card is wrapped in container.NewPadded here (not inside
+		// makeInstanceCard/makeAddCard themselves) so the extra space shows
+		// up as a gap BETWEEN cards in the GridWrapLayout, rather than as
+		// inner padding that would just make each card bigger.
 		for _, name := range sortedInstanceNames(cfg.Instances) {
-			cardsBox.Add(makeInstanceCard(name))
+			cardsBox.Add(container.NewPadded(makeInstanceCard(name)))
 		}
-		cardsBox.Add(makeAddCard())
+		cardsBox.Add(container.NewPadded(makeAddCard()))
 		cardsBox.Refresh()
 	}
 
@@ -243,7 +252,12 @@ func ShowPicker(cfg *appconfig.Config) PickResult {
 
 	bottomBar := container.NewBorder(nil, nil, showOnStartup, settingsBtn)
 
-	cardsScroll := container.NewVScroll(cardsBox)
+	// bottomSpacer gives the scroll area breathing room below the last row
+	// of cards, so it doesn't sit flush against bottomBar (the "Show on
+	// startup" / "Settings" row) when scrolled all the way down.
+	bottomSpacer := canvas.NewRectangle(color.Transparent)
+	bottomSpacer.SetMinSize(fyne.NewSize(0, cardBottomGap))
+	cardsScroll := container.NewVScroll(container.NewVBox(cardsBox, bottomSpacer))
 
 	content := container.NewBorder(
 		container.NewVBox(headerRow, widget.NewSeparator()),
