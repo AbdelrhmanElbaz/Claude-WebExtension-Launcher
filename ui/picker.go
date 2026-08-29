@@ -29,14 +29,56 @@ var (
 	colorUsageWarn   = color.NRGBA{R: 0xD9, G: 0x8C, B: 0x0D, A: 0xFF} // 60-89%
 	colorUsageHigh   = color.NRGBA{R: 0xDC, G: 0x26, B: 0x26, A: 0xFF} // >= 90%
 
-	// Slightly larger than the card's actual content needs, to leave room
-	// for the container.NewPadded wrapper added around each card in
-	// rebuildCards (that padding is what creates the visible gap between
-	// cards in the GridWrapLayout, at the cost of a bit of cell size).
-	cardMinSize  = fyne.NewSize(256, 236)
-	cardBottomGap = float32(20) // margin below the last row of cards
+	// cardSize is the card's own rendered size (not the grid cell size —
+	// see cardGap/cardWrapLayout below). Big enough that the footer
+	// (Notes/Launch buttons) never gets clipped by the row below it.
+	cardSize = fyne.NewSize(260, 300)
+	// cardGap is the space left BETWEEN cards, both horizontally and
+	// vertically. container.NewPadded alone only gives ~theme.Padding()*2
+	// (a few px) which reads as almost no gap — cardWrapLayout below adds
+	// this explicitly instead, independent of theme/Fyne version.
+	cardGap = float32(64)
+	// GridWrapLayout arranges children into cells of exactly this size, so
+	// the cell must be big enough to hold cardSize *plus* the gap that
+	// cardWrapLayout will carve out of it.
+	cardMinSize   = fyne.NewSize(cardSize.Width+cardGap, cardSize.Height+cardGap)
+	cardBottomGap = cardGap // margin below the last row of cards, same size as the inter-card gap
 	usageRefresh = time.Minute
 )
+
+// cardWrapLayout reserves cardGap/2 of empty space on every side of its
+// single child, so the child renders smaller than the cell GridWrapLayout
+// gives it — that leftover space is what shows up as a visible gap between
+// cards. Implemented by hand (rather than relying on container.NewPadded,
+// whose padding is just theme.Padding()) so the gap size is explicit and
+// doesn't depend on the active theme or Fyne version.
+type cardWrapLayout struct {
+	pad float32
+}
+
+func (c cardWrapLayout) MinSize(objects []fyne.CanvasObject) fyne.Size {
+	if len(objects) == 0 {
+		return fyne.NewSize(0, 0)
+	}
+	s := objects[0].MinSize()
+	return fyne.NewSize(s.Width+2*c.pad, s.Height+2*c.pad)
+}
+
+func (c cardWrapLayout) Layout(objects []fyne.CanvasObject, size fyne.Size) {
+	if len(objects) == 0 {
+		return
+	}
+	o := objects[0]
+	o.Resize(fyne.NewSize(size.Width-2*c.pad, size.Height-2*c.pad))
+	o.Move(fyne.NewPos(c.pad, c.pad))
+}
+
+// withGap wraps a card so it renders with cardGap/2 empty space on every
+// side — combined with the same amount from its neighbor, that's a full
+// cardGap of visible space between any two adjacent cards.
+func withGap(card fyne.CanvasObject) fyne.CanvasObject {
+	return container.New(cardWrapLayout{pad: cardGap / 2}, card)
+}
 
 // PickResult is what the picker window returns once the user makes a choice.
 type PickResult struct {
@@ -209,14 +251,14 @@ func ShowPicker(cfg *appconfig.Config) PickResult {
 	rebuildCards = func() {
 		notes = loadNotes() // pick up anything saved from a just-closed note editor
 		cardsBox.Objects = nil
-		// Each card is wrapped in container.NewPadded here (not inside
+		// Each card is wrapped with withGap here (not inside
 		// makeInstanceCard/makeAddCard themselves) so the extra space shows
 		// up as a gap BETWEEN cards in the GridWrapLayout, rather than as
 		// inner padding that would just make each card bigger.
 		for _, name := range sortedInstanceNames(cfg.Instances) {
-			cardsBox.Add(container.NewPadded(makeInstanceCard(name)))
+			cardsBox.Add(withGap(makeInstanceCard(name)))
 		}
-		cardsBox.Add(container.NewPadded(makeAddCard()))
+		cardsBox.Add(withGap(makeAddCard()))
 		cardsBox.Refresh()
 	}
 
