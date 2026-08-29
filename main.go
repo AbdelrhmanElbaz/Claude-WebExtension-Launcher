@@ -109,7 +109,13 @@ func main() {
 	// Ensure Claude is patched and extensions are up-to-date.
 	// On Windows this may invoke an elevated patcher subprocess via UAC.
 	// On macOS this runs in-process.
-	if err := ensureClaudeReady(*forceUpdate); err != nil {
+	if cfg.SkipClaudeUpdateCheck {
+		fmt.Println("Skipping Claude update/patch check (disabled in Settings)")
+		if _, statErr := os.Stat(claudeExecutablePath()); statErr != nil {
+			fmt.Println("Error: Claude is not installed yet and update checks are disabled. Turn 'Skip Claude update check' off in Settings for the first run.")
+			os.Exit(1)
+		}
+	} else if err := ensureClaudeReady(*forceUpdate); err != nil {
 		if _, statErr := os.Stat(claudeExecutablePath()); statErr == nil {
 			fmt.Printf("Warning: %v\n", err)
 			fmt.Println("Continuing with existing installation...")

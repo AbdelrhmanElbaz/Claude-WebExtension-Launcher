@@ -182,6 +182,11 @@ func ShowSettings(a fyne.App, cfg *appconfig.Config) {
 	})
 	debugMode.SetChecked(cfg.DebugMode)
 
+	skipClaudeUpdateCheck := widget.NewCheck("Skip Claude update check (also skips the admin/UAC prompt)", func(checked bool) {
+		cfg.SkipClaudeUpdateCheck = checked
+	})
+	skipClaudeUpdateCheck.SetChecked(cfg.SkipClaudeUpdateCheck)
+
 	saveBtn := widget.NewButton("Save", func() {
 		_ = cfg.Save()
 		w.Close()
@@ -193,6 +198,7 @@ func ShowSettings(a fyne.App, cfg *appconfig.Config) {
 		autoUpdate,
 		forceUpdate,
 		debugMode,
+		skipClaudeUpdateCheck,
 		layout.NewSpacer(),
 		saveBtn,
 	)

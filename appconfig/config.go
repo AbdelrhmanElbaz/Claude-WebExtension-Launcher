@@ -28,6 +28,13 @@ type Config struct {
 	ForceUpdate bool `json:"force_update"`
 	DebugMode   bool `json:"debug_mode"`
 	AutoUpdate  bool `json:"auto_update"` // maps to skipping selfupdate.CheckAndUpdate when false
+
+	// SkipClaudeUpdateCheck disables ensureClaudeReady's version check/patch
+	// step entirely (the one that triggers the UAC "administrator privileges
+	// required for patching" prompt on Windows). This is separate from
+	// AutoUpdate, which only controls the *launcher's own* self-update check.
+	// When true, Claude is launched as-is with no patch/update attempt.
+	SkipClaudeUpdateCheck bool `json:"skip_claude_update_check"`
 }
 
 // Default returns the config used the first time the app ever runs.
@@ -36,9 +43,10 @@ func Default() *Config {
 		Instances:           []string{"modified"},
 		LastUsedInstance:    "modified",
 		ShowPickerOnStartup: true,
-		ForceUpdate:         false,
-		DebugMode:           false,
-		AutoUpdate:          true,
+		ForceUpdate:           false,
+		DebugMode:             false,
+		AutoUpdate:            true,
+		SkipClaudeUpdateCheck: false,
 	}
 }
 
