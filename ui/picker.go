@@ -4,6 +4,9 @@
 package ui
 
 import (
+	"image/color"
+	"time"
+
 	"claude-webext-patcher/appconfig"
 
 	"fyne.io/fyne/v2"
@@ -14,6 +17,20 @@ import (
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+)
+
+// Design tokens. Pulled from the "Minimalism & Swiss Style" system (best fit
+// for an internal tool/dashboard): navy primary, calm neutral background,
+// green/amber/red reserved strictly for usage-level meaning, never decoration.
+var (
+	colorBorder      = color.NRGBA{R: 0xE4, G: 0xE7, B: 0xEB, A: 0xFF}
+	colorMuted       = color.NRGBA{R: 0x47, G: 0x55, B: 0x69, A: 0xFF}
+	colorUsageOK     = color.NRGBA{R: 0x05, G: 0x96, B: 0x69, A: 0xFF} // < 60%
+	colorUsageWarn   = color.NRGBA{R: 0xD9, G: 0x8C, B: 0x0D, A: 0xFF} // 60-89%
+	colorUsageHigh   = color.NRGBA{R: 0xDC, G: 0x26, B: 0x26, A: 0xFF} // >= 90%
+
+	cardMinSize  = fyne.NewSize(240, 220)
+	usageRefresh = time.Minute
 )
 
 // PickResult is what the picker window returns once the user makes a choice.
@@ -29,9 +46,10 @@ type PickResult struct {
 func ShowPicker(cfg *appconfig.Config) PickResult {
 	a := app.New()
 	w := a.NewWindow("Claude WebExtension Launcher")
-	w.Resize(fyne.NewSize(640, 420))
+	w.Resize(fyne.NewSize(900, 560))
 
 	result := PickResult{Cancelled: true}
+	notes := loadNotes()
 
 	var cardsBox *fyne.Container
 	var rebuildCards func()
@@ -46,7 +64,7 @@ func ShowPicker(cfg *appconfig.Config) PickResult {
 
 	removeInstance := func(name string) {
 		dialog.ShowConfirm("Remove instance",
-			"Remove \""+name+"\" from the list?\n(This only forgets it here - it does not delete its Claude data folder.)",
+			"Remove \""+name+"\" from the list?\n(This only forgets it here — it does not delete its Claude data folder or its notes.)",
 			func(confirmed bool) {
 				if !confirmed {
 					return
@@ -57,44 +75,111 @@ func ShowPicker(cfg *appconfig.Config) PickResult {
 			}, w)
 	}
 
+	// usageBar renders a labeled percentage row: "5h  [=====     ] 41%".
+	usageBar := func(label string, pct int, has bool) fyne.CanvasObject {
+		nameLbl := widget.NewLabel(label)
+		nameLbl.Alignment = fyne.TextAlignLeading
+
+		if !has {
+			dash := widget.NewLabel("—")
+			dash.Alignment = fyne.TextAlignTrailing
+			return container.NewBorder(nil, nil, nameLbl, nil, dash)
+		}
+
+		bar := widget.NewProgressBar()
+		bar.Min, bar.Max = 0, 100
+		bar.Value = float64(pct)
+
+		pctColor := colorUsageOK
+		switch {
+		case pct >= 90:
+			pctColor = colorUsageHigh
+		case pct >= 60:
+			pctColor = colorUsageWarn
+		}
+		pctLbl := canvas.NewText(itoa(pct)+"%", pctColor)
+		pctLbl.TextStyle = fyne.TextStyle{Bold: true}
+
+		row := container.NewBorder(nil, nil, nameLbl, pctLbl, bar)
+		return row
+	}
+
+	// buildUsageSection reads fresh data from disk each call — cheap (one
+	// small JSON file) and called at most once/minute per visible card, so
+	// no caching layer is needed.
+	buildUsageSection := func(name string) fyne.CanvasObject {
+		u := ReadInstanceUsage(name)
+
+		lastActive := widget.NewLabel("Last active: " + RelativeTime(u.LastActive))
+		lastActive.TextStyle = fyne.TextStyle{Italic: true}
+
+		return container.NewVBox(
+			usageBar("5h", u.FiveHourPct, u.HasUsage),
+			usageBar("7d", u.WeeklyPct, u.HasUsage),
+			lastActive,
+		)
+	}
+
 	makeInstanceCard := func(name string) fyne.CanvasObject {
 		icon := widget.NewIcon(theme.AccountIcon())
-		label := widget.NewLabelWithStyle(name, fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+		label := widget.NewLabelWithStyle(name, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 
 		menuBtn := widget.NewButtonWithIcon("", theme.MoreVerticalIcon(), func() {
 			removeInstance(name)
 		})
 		menuBtn.Importance = widget.LowImportance
 
-		top := container.NewBorder(nil, nil, nil, menuBtn)
-		content := container.NewVBox(
-			top,
-			container.NewCenter(icon),
-			container.NewCenter(label),
+		header := container.NewBorder(nil, nil,
+			container.NewHBox(icon, label), menuBtn)
+
+		usageSection := buildUsageSection(name)
+
+		entry := notes.get(name)
+		quickNote := makeQuickNoteEntry(name, entry.QuickNote)
+
+		notesBtn := widget.NewButtonWithIcon("Notes", theme.DocumentIcon(), func() {
+			ShowFullNoteEditor(a, name)
+		})
+		notesBtn.Importance = widget.LowImportance
+
+		launchBtn := widget.NewButton("Launch", func() { chooseInstance(name) })
+		launchBtn.Importance = widget.HighImportance
+
+		footer := container.NewBorder(nil, nil, notesBtn, launchBtn)
+
+		body := container.NewVBox(
+			header,
+			widget.NewSeparator(),
+			usageSection,
+			quickNote,
+			footer,
 		)
 
 		bg := canvas.NewRectangle(theme.InputBackgroundColor())
-		card := container.NewStack(bg, container.NewPadded(content))
+		bg.StrokeColor = colorBorder
+		bg.StrokeWidth = 1
+		bg.CornerRadius = 8
 
-		btn := widget.NewButton("", func() { chooseInstance(name) })
-		btn.Importance = widget.LowImportance
-
-		// btn must be BELOW card in the stack: it's a transparent full-card
-		// hit target for "select this instance", but card (on top) still
-		// contains its own tappable menuBtn. Fyne hit-tests top-down, so
-		// menuBtn (topmost at its position) gets the click instead of being
-		// swallowed by btn, and card's opaque background stops btn's hover
-		// highlight from showing through and hiding the icon/label.
-		return container.NewStack(btn, card)
+		padded := container.NewPadded(body)
+		// cardsBox (GridWrapLayout, cardMinSize) is what enforces sizing —
+		// this card just needs to be a single stacked CanvasObject.
+		return container.NewStack(bg, padded)
 	}
 
 	makeAddCard := func() fyne.CanvasObject {
 		plus := widget.NewLabelWithStyle("+", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
-		addLabel := widget.NewLabel("Add")
+		addLabel := widget.NewLabel("Add instance")
 		content := container.NewVBox(
-			container.NewCenter(addLabel),
+			layout.NewSpacer(),
 			container.NewCenter(plus),
+			container.NewCenter(addLabel),
+			layout.NewSpacer(),
 		)
+
+		bg := canvas.NewRectangle(color.Transparent)
+		bg.StrokeColor = colorBorder
+		bg.StrokeWidth = 1
+		bg.CornerRadius = 8
 
 		btn := widget.NewButton("", func() {
 			entry := widget.NewEntry()
@@ -113,27 +198,34 @@ func ShowPicker(cfg *appconfig.Config) PickResult {
 		})
 		btn.Importance = widget.LowImportance
 
-		return container.NewStack(container.NewPadded(content), btn)
+		return container.NewStack(bg, container.NewPadded(content), btn)
 	}
 
 	rebuildCards = func() {
+		notes = loadNotes() // pick up anything saved from a just-closed note editor
 		cardsBox.Objects = nil
-		for _, name := range cfg.Instances {
+		for _, name := range sortedInstanceNames(cfg.Instances) {
 			cardsBox.Add(makeInstanceCard(name))
 		}
 		cardsBox.Add(makeAddCard())
 		cardsBox.Refresh()
 	}
 
-	cardsBox = container.New(layout.NewGridWrapLayout(fyne.NewSize(130, 130)))
+	cardsBox = container.New(layout.NewGridWrapLayout(cardMinSize))
 	rebuildCards()
 
 	title := widget.NewLabelWithStyle("Who's launching Claude?", fyne.TextAlignCenter,
 		fyne.TextStyle{Bold: true})
-	subtitle := widget.NewLabelWithStyle("Pick an instance, or add a new one. Each instance keeps its own extensions and data.",
+	subtitle := widget.NewLabelWithStyle(
+		"Pick an instance, or add a new one. Each instance keeps its own extensions, data and notes.",
 		fyne.TextAlignCenter, fyne.TextStyle{})
 	subtitle.Wrapping = fyne.TextWrapWord
-	subtitleBox := container.New(layout.NewGridWrapLayout(fyne.NewSize(560, 40)), subtitle)
+
+	refreshBtn := widget.NewButtonWithIcon("", theme.ViewRefreshIcon(), rebuildCards)
+	refreshBtn.Importance = widget.LowImportance
+
+	headerRow := container.NewBorder(nil, nil, nil, refreshBtn,
+		container.NewVBox(container.NewCenter(title), container.NewCenter(subtitle)))
 
 	showOnStartup := widget.NewCheck("Show on startup", func(checked bool) {
 		cfg.ShowPickerOnStartup = checked
@@ -147,15 +239,36 @@ func ShowPicker(cfg *appconfig.Config) PickResult {
 
 	bottomBar := container.NewBorder(nil, nil, showOnStartup, settingsBtn)
 
+	cardsScroll := container.NewVScroll(cardsBox)
+
 	content := container.NewBorder(
-		container.NewVBox(container.NewCenter(title), container.NewCenter(subtitleBox), widget.NewSeparator()),
+		container.NewVBox(headerRow, widget.NewSeparator()),
 		bottomBar,
 		nil, nil,
-		container.NewCenter(cardsBox),
+		cardsScroll,
 	)
 
 	w.SetContent(container.NewPadded(content))
 	w.CenterOnScreen()
+
+	// Auto-refresh usage numbers + last-active labels once a minute while
+	// the picker is open, so the window doesn't need to be reopened to see
+	// updated percentages. Manual refresh is also available via refreshBtn.
+	stopRefresh := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(usageRefresh)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				rebuildCards()
+			case <-stopRefresh:
+				return
+			}
+		}
+	}()
+	defer close(stopRefresh)
+
 	w.ShowAndRun()
 
 	return result
