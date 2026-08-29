@@ -226,7 +226,7 @@ func ShowFullNoteEditor(a fyne.App, instanceName string) {
 	// Whole-document toggle: Ctrl+` (KeyGraveAccent covers the physical key
 	// that types ذ on Arabic keyboard layouts too, since it's a *physical*
 	// key binding, not a rune binding).
-	wholeDirShortcut := &desktop.CustomShortcut{KeyName: fyne.KeyGraveAccent, Modifier: fyne.KeyModifierControl}
+	wholeDirShortcut := &desktop.CustomShortcut{KeyName: fyne.KeyBackTick, Modifier: fyne.KeyModifierControl}
 	w.Canvas().AddShortcut(wholeDirShortcut, func(fyne.Shortcut) {
 		editor.SetText(toggleWholeTextDirection(editor.Text))
 		syncPreview()
