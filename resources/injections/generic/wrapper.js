@@ -3,7 +3,6 @@
 const { app, session, Notification } = require("electron");
 const path = require("path");
 const fs = require("fs");
-const https = require("https");
 
 // ================================================================
 // Instance isolation — redirect userData before anything reads it
@@ -42,84 +41,6 @@ while (searchDir !== path.dirname(searchDir)) {
 }
 
 // ================================================================
-// Live usage — read the SAME two things the Usage Tracker extension
-// itself reads (the `lastActiveOrg` and `sessionKey` cookies for
-// claude.ai) and hit the SAME endpoint it hits
-// (GET /api/organizations/<org>/usage), instead of guessing at some
-// persisted copy. There isn't one — the extension computes this fresh
-// on every read and never writes it to disk (confirmed by reading its
-// source: getUsageData() in bg-components/claude-api.js always makes a
-// live request). We do the same request from here, in the one place
-// that already has legitimate access to this instance's own session
-// cookies, and drop the result in a small JSON file next to userData
-// so the launcher (a separate process) can read it without needing
-// its own copy of the session.
-// ================================================================
-const USAGE_LIVE_FILE = "usage-live.json";
-const USAGE_FETCH_INTERVAL_MS = 5 * 60 * 1000;
-
-function httpsGetJson(url, cookieHeader) {
-    return new Promise((resolve) => {
-        const req = https.get(url, {
-            headers: { Cookie: cookieHeader, Accept: "application/json" }
-        }, (res) => {
-            let body = "";
-            res.on("data", (chunk) => { body += chunk; });
-            res.on("end", () => {
-                if (res.statusCode !== 200) {
-                    resolve({ error: `HTTP ${res.statusCode}` });
-                    return;
-                }
-                try {
-                    resolve({ data: JSON.parse(body) });
-                } catch (err) {
-                    resolve({ error: "bad JSON: " + err.message });
-                }
-            });
-        });
-        req.on("error", (err) => resolve({ error: err.message }));
-        req.end();
-    });
-}
-
-async function fetchLiveUsage() {
-    try {
-        const cookies = await session.defaultSession.cookies.get({ domain: "claude.ai" });
-        const sessionKey = cookies.find((c) => c.name === "sessionKey")?.value;
-        const orgId = cookies.find((c) => c.name === "lastActiveOrg")?.value;
-
-        const outPath = path.join(app.getPath("userData"), USAGE_LIVE_FILE);
-
-        if (!sessionKey || !orgId) {
-            // Not logged in yet, or no active org selected — write nothing over a
-            // possibly-still-valid previous reading; just note we couldn't refresh.
-            console.log("EXT_LOG: usage fetch skipped (not logged in yet)");
-            return;
-        }
-
-        const cookieHeader = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
-        const result = await httpsGetJson(
-            `https://claude.ai/api/organizations/${orgId}/usage`,
-            cookieHeader
-        );
-
-        if (result.error) {
-            console.error("EXT_LOG: usage fetch failed:", result.error);
-            return;
-        }
-
-        fs.writeFileSync(outPath, JSON.stringify({
-            fetchedAt: Date.now(),
-            orgId,
-            usage: result.data
-        }));
-        console.log("EXT_LOG: usage-live.json updated for org", orgId);
-    } catch (err) {
-        console.error("EXT_LOG: usage fetch threw:", err);
-    }
-}
-
-// ================================================================
 // Extension loading — runs as soon as the app is ready
 // ================================================================
 const SENTINEL_STRING = "SENTINEL_EXT_LOADED";
@@ -130,20 +51,6 @@ let sentinelReceived = false;
 
 app.on("ready", () => {
     session.defaultSession.clearCache();
-
-    // First read as soon as we can (login may not have happened yet — that's fine,
-    // fetchLiveUsage no-ops until sessionKey/lastActiveOrg exist), then keep it fresh.
-    fetchLiveUsage();
-    setInterval(fetchLiveUsage, USAGE_FETCH_INTERVAL_MS);
-
-    // Also refresh right after login (when sessionKey/lastActiveOrg first get set) instead
-    // of waiting up to USAGE_FETCH_INTERVAL_MS for the first real reading.
-    session.defaultSession.cookies.on("changed", (_event, cookie) => {
-        if (cookie.domain?.includes("claude.ai") &&
-            (cookie.name === "sessionKey" || cookie.name === "lastActiveOrg")) {
-            fetchLiveUsage();
-        }
-    });
 
     if (!extPath) return;
 

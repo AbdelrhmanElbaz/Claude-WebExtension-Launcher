@@ -112,22 +112,49 @@ func readUsageFromLegacyFile(instanceName string) (rawUsageFile, bool) {
 	return f, true
 }
 
+// FetchAllUsage runs ReadInstanceUsage for every given instance name
+// concurrently and returns a name->InstanceUsage map. Used by the picker to
+// gather live data for every card before building any of them, so N
+// instances cost roughly one usageFetchTimeout, not N of them serially.
+func FetchAllUsage(names []string) map[string]InstanceUsage {
+	type result struct {
+		name  string
+		usage InstanceUsage
+	}
+	results := make(chan result, len(names))
+
+	for _, name := range names {
+		go func(n string) {
+			results <- result{name: n, usage: ReadInstanceUsage(n)}
+		}(name)
+	}
+
+	out := make(map[string]InstanceUsage, len(names))
+	for range names {
+		r := <-results
+		out[r.name] = r.usage
+	}
+	return out
+}
+
 // ReadInstanceUsage returns one instance's usage row, combining two
 // independent sources that each answer a different question:
 //
-//   - The 5h/7d PERCENTAGES come from usage-live.json (see usage_live.go) —
-//     a real live reading, fetched by wrapper.js from the same API endpoint
-//     the extension itself calls, using that instance's own claude.ai
-//     session. This is polled periodically (every few minutes) by
-//     wrapper.js regardless of whether the user is actually doing anything,
-//     so its own fetch timestamp is a poor proxy for "last active".
+//   - The 5h/7d PERCENTAGES come from fetchLiveUsageDirect (usage_fetch.go)
+//     — a real live reading, made by this Go process itself by decrypting
+//     the instance's own claude.ai session cookies off disk and calling the
+//     same /usage endpoint the extension calls. No running claude.exe
+//     required, so this works the instant the picker opens.
 //   - The LAST-ACTIVE timestamp still comes from plan-usage-history.json,
 //     written by Claude Desktop itself only when the user actually does
-//     something — that's genuine activity, unlike our fixed-interval poll.
+//     something — that's a genuine activity signal, unlike a UI-open-time
+//     fetch timestamp.
 //
-// If usage-live.json is missing entirely (e.g. instance never launched
-// under a build that writes it yet), we fall back to the percentages baked
-// into plan-usage-history.json too, same as before this file existed.
+// If the direct fetch fails for any reason (never logged in, expired
+// session, offline), we fall back to whatever percentage
+// plan-usage-history.json last recorded — which may itself be stale; see
+// the open question about whether to show "—" instead once this new path
+// has proven reliable in practice.
 func ReadInstanceUsage(instanceName string) InstanceUsage {
 	var out InstanceUsage
 
@@ -138,15 +165,15 @@ func ReadInstanceUsage(instanceName string) InstanceUsage {
 		out.HasActivity = true
 	}
 
-	if _, fh, sd, ok := readLiveUsageFile(instanceName); ok {
+	if fh, sd, ok := fetchLiveUsageDirect(instanceName); ok {
 		out.FiveHourPct = fh
 		out.WeeklyPct = sd
 		out.HasUsage = true
 		return out
 	}
 
-	// No live reading yet — fall back to whatever plan-usage-history.json
-	// last recorded, walking backwards for the most recent non-empty "u".
+	// No live reading — fall back to whatever plan-usage-history.json last
+	// recorded, walking backwards for the most recent non-empty "u".
 	if !hasLegacy {
 		return out
 	}

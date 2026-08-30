@@ -19,6 +19,14 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
+// devBuildLabel is a plain, always-visible marker in the picker's top-right
+// corner that advances one letter (A, B, C, ...) every time a code change is
+// made and shipped — purely so a freshly rebuilt binary can be told apart
+// from a stale one at a glance, with zero ambiguity about whether new code
+// is actually running. Bump this one letter forward with EVERY edit, no
+// exceptions, even a one-line change.
+const devBuildLabel = "Build B"
+
 // Design tokens. Pulled from the "Minimalism & Swiss Style" system (best fit
 // for an internal tool/dashboard): navy primary, calm neutral background,
 // green/amber/red reserved strictly for usage-level meaning, never decoration.
@@ -100,6 +108,7 @@ func ShowPicker(cfg *appconfig.Config) PickResult {
 
 	var cardsBox *fyne.Container
 	var rebuildCards func()
+	var usageData map[string]InstanceUsage
 
 	chooseInstance := func(name string) {
 		result = PickResult{InstanceName: name}
@@ -151,11 +160,13 @@ func ShowPicker(cfg *appconfig.Config) PickResult {
 		return row
 	}
 
-	// buildUsageSection reads fresh data from disk each call — cheap (one
-	// small JSON file) and called at most once/minute per visible card, so
-	// no caching layer is needed.
+	// buildUsageSection reads from the usageData map populated by
+	// FetchAllUsage just before this call — never call ReadInstanceUsage
+	// per-card directly here, since each call can now make a real network
+	// request (see usage_fetch.go); doing that serially per card would make
+	// opening the picker with N instances take up to N * 5s.
 	buildUsageSection := func(name string) fyne.CanvasObject {
-		u := ReadInstanceUsage(name)
+		u := usageData[name]
 
 		lastActive := widget.NewLabel("Last active: " + RelativeTime(u.LastActive))
 		lastActive.TextStyle = fyne.TextStyle{Italic: true}
@@ -250,12 +261,17 @@ func ShowPicker(cfg *appconfig.Config) PickResult {
 
 	rebuildCards = func() {
 		notes = loadNotes() // pick up anything saved from a just-closed note editor
+		names := sortedInstanceNames(cfg.Instances)
+		// Fetch every instance's usage concurrently (each may make a real
+		// network request now — see usage_fetch.go) before building any
+		// cards, so a slow/offline account doesn't hold up the others.
+		usageData = FetchAllUsage(names)
 		cardsBox.Objects = nil
 		// Each card is wrapped with withGap here (not inside
 		// makeInstanceCard/makeAddCard themselves) so the extra space shows
 		// up as a gap BETWEEN cards in the GridWrapLayout, rather than as
 		// inner padding that would just make each card bigger.
-		for _, name := range sortedInstanceNames(cfg.Instances) {
+		for _, name := range names {
 			cardsBox.Add(withGap(makeInstanceCard(name)))
 		}
 		cardsBox.Add(withGap(makeAddCard()))
@@ -279,7 +295,11 @@ func ShowPicker(cfg *appconfig.Config) PickResult {
 	refreshBtn := widget.NewButtonWithIcon("", theme.ViewRefreshIcon(), rebuildCards)
 	refreshBtn.Importance = widget.LowImportance
 
-	headerRow := container.NewBorder(nil, nil, nil, refreshBtn,
+	buildLbl := widget.NewLabel(devBuildLabel)
+	buildLbl.TextStyle = fyne.TextStyle{Monospace: true}
+
+	headerRow := container.NewBorder(nil, nil, nil,
+		container.NewHBox(buildLbl, refreshBtn),
 		container.NewVBox(container.NewCenter(title), container.NewCenter(subtitleBox)))
 
 	showOnStartup := widget.NewCheck("Show on startup", func(checked bool) {
