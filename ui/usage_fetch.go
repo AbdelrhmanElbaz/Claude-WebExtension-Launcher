@@ -36,8 +36,8 @@ import (
 const usageSnapshotMaxAge = 30 * time.Minute
 
 type usageLimit struct {
-	Percentage int    `json:"percentage"`
-	ResetsAt   string `json:"resetsAt"`
+	Percentage int   `json:"percentage"`
+	ResetsAt   int64 `json:"resetsAt"` // epoch milliseconds, as exported by the extension
 }
 
 type usageDataJSON struct {
