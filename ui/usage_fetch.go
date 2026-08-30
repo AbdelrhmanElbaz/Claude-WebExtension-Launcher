@@ -4,6 +4,10 @@
 // instance's own disk (see usage_cookies_windows.go / usage_cookies_other.go
 // for readSessionCookies). No running claude.exe is required — this is what
 // lets the picker show live numbers for every instance the moment it opens.
+//
+// Every failure path here calls logUsage (usage_log.go) before returning
+// ok=false, so a failed read is never silent — check
+// %APPDATA%\ClaudeWebExtLauncher\usage-debug.log.
 package ui
 
 import (
@@ -20,19 +24,23 @@ const usageFetchTimeout = 5 * time.Second
 
 // fetchLiveUsageDirect returns ok=false for every "nothing to show" case:
 // never logged in (no sessionKey/lastActiveOrg cookie yet), an expired
-// session (401/403), no network, or a response we don't recognize.
+// session (401/403), no network, or a response we don't recognize. See
+// usage-debug.log for which of these it was.
 func fetchLiveUsageDirect(instanceName string) (fh, sd int, ok bool) {
 	sessionKey, orgID, found := readSessionCookies(instanceName)
 	if !found || sessionKey == "" || orgID == "" {
+		logUsage(instanceName, "fetch: no usable session cookies (found=%v sessionKey_empty=%v orgID_empty=%v)",
+			found, sessionKey == "", orgID == "")
 		return 0, 0, false
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), usageFetchTimeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		"https://claude.ai/api/organizations/"+orgID+"/usage", nil)
+	url := "https://claude.ai/api/organizations/" + orgID + "/usage"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
+		logUsage(instanceName, "fetch: NewRequestWithContext failed: %v", err)
 		return 0, 0, false
 	}
 
@@ -53,14 +61,36 @@ func fetchLiveUsageDirect(instanceName string) (fh, sd int, ok bool) {
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
+		logUsage(instanceName, "fetch: request to %s failed: %v", url, err)
 		return 0, 0, false
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1MB cap, response is tiny JSON
-	if err != nil || resp.StatusCode != http.StatusOK {
+	if err != nil {
+		logUsage(instanceName, "fetch: reading response body failed: %v", err)
+		return 0, 0, false
+	}
+	if resp.StatusCode != http.StatusOK {
+		// Include a truncated body snippet — this is almost always where
+		// the real answer lives (401 "unauthorized", org not found, etc.)
+		snippet := body
+		if len(snippet) > 300 {
+			snippet = snippet[:300]
+		}
+		logUsage(instanceName, "fetch: HTTP %d from %s, body: %s", resp.StatusCode, url, snippet)
 		return 0, 0, false
 	}
 
-	return parseUsagePercentages(body)
+	fh, sd, ok = parseUsagePercentages(body)
+	if !ok {
+		snippet := body
+		if len(snippet) > 300 {
+			snippet = snippet[:300]
+		}
+		logUsage(instanceName, "fetch: HTTP 200 but response didn't match either known shape, body: %s", snippet)
+		return 0, 0, false
+	}
+	logUsage(instanceName, "fetch: OK fh=%d sd=%d", fh, sd)
+	return fh, sd, true
 }

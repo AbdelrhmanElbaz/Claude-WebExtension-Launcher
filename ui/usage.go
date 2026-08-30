@@ -140,26 +140,29 @@ func FetchAllUsage(names []string) map[string]InstanceUsage {
 // ReadInstanceUsage returns one instance's usage row, combining two
 // independent sources that each answer a different question:
 //
-//   - The 5h/7d PERCENTAGES come from fetchLiveUsageDirect (usage_fetch.go)
-//     — a real live reading, made by this Go process itself by decrypting
-//     the instance's own claude.ai session cookies off disk and calling the
-//     same /usage endpoint the extension calls. No running claude.exe
-//     required, so this works the instant the picker opens.
+//   - The 5h/7d PERCENTAGES come *only* from fetchLiveUsageDirect
+//     (usage_fetch.go) — a real live reading, made by this Go process
+//     itself by decrypting the instance's own claude.ai session cookies
+//     off disk and calling the same /usage endpoint the extension calls.
+//     No running claude.exe required, so this works the instant the
+//     picker opens. If this fails for any reason (never logged in,
+//     expired session, offline, edge block), HasUsage stays false and the
+//     UI shows "—" — we deliberately do NOT fall back to any percentage
+//     from plan-usage-history.json anymore. That file's numbers had gone
+//     stale/wrong for everyone since ~Aug 22 2026 (see package comment
+//     above) and silently substituting them was actively misleading:
+//     the UI looked "live" while showing a days-old percentage. Check
+//     %APPDATA%\ClaudeWebExtLauncher\usage-debug.log for why a given
+//     instance's live fetch failed.
 //   - The LAST-ACTIVE timestamp still comes from plan-usage-history.json,
 //     written by Claude Desktop itself only when the user actually does
-//     something — that's a genuine activity signal, unlike a UI-open-time
-//     fetch timestamp.
-//
-// If the direct fetch fails for any reason (never logged in, expired
-// session, offline), we fall back to whatever percentage
-// plan-usage-history.json last recorded — which may itself be stale; see
-// the open question about whether to show "—" instead once this new path
-// has proven reliable in practice.
+//     something — that's a genuine activity signal (a timestamp, not a
+//     usage number), so it's kept even when the live percentage fetch
+//     fails.
 func ReadInstanceUsage(instanceName string) InstanceUsage {
 	var out InstanceUsage
 
-	legacy, hasLegacy := readUsageFromLegacyFile(instanceName)
-	if hasLegacy && len(legacy.Samples) > 0 {
+	if legacy, hasLegacy := readUsageFromLegacyFile(instanceName); hasLegacy && len(legacy.Samples) > 0 {
 		last := legacy.Samples[len(legacy.Samples)-1]
 		out.LastActive = time.UnixMilli(last.T)
 		out.HasActivity = true
@@ -169,31 +172,10 @@ func ReadInstanceUsage(instanceName string) InstanceUsage {
 		out.FiveHourPct = fh
 		out.WeeklyPct = sd
 		out.HasUsage = true
-		return out
 	}
-
-	// No live reading — fall back to whatever plan-usage-history.json last
-	// recorded, walking backwards for the most recent non-empty "u".
-	if !hasLegacy {
-		return out
-	}
-	for i := len(legacy.Samples) - 1; i >= 0; i-- {
-		s := legacy.Samples[i]
-		if !sampleHasUsage(s.U) {
-			continue
-		}
-		var u struct {
-			FH int `json:"fh"`
-			SD int `json:"sd"`
-		}
-		if err := json.Unmarshal(s.U, &u); err != nil {
-			continue
-		}
-		out.FiveHourPct = u.FH
-		out.WeeklyPct = u.SD
-		out.HasUsage = true
-		break
-	}
+	// No "else" branch: on failure, out.HasUsage stays false (FiveHourPct/
+	// WeeklyPct stay 0 but are meaningless — the UI must check HasUsage,
+	// not treat 0 as a real reading) and the picker should render "—".
 
 	return out
 }

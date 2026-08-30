@@ -224,20 +224,37 @@ func readEncryptedCookies(instanceName string) (sessionKeyEnc, orgIDEnc []byte, 
 func readSessionCookies(instanceName string) (sessionKey, orgID string, ok bool) {
 	masterKey, err := loadMasterKey(instanceName)
 	if err != nil {
+		logUsage(instanceName, "cookies: loadMasterKey failed: %v", err)
 		return "", "", false
 	}
 
 	sessEnc, orgEnc, err := readEncryptedCookies(instanceName)
-	if err != nil || len(sessEnc) == 0 || len(orgEnc) == 0 {
+	if err != nil {
+		logUsage(instanceName, "cookies: readEncryptedCookies failed: %v", err)
+		return "", "", false
+	}
+	if len(sessEnc) == 0 || len(orgEnc) == 0 {
+		logUsage(instanceName, "cookies: missing cookie row(s) (sessionKey_present=%v lastActiveOrg_present=%v) — instance likely never logged in",
+			len(sessEnc) != 0, len(orgEnc) != 0)
 		return "", "", false
 	}
 
 	sess, err := decryptCookieValue(masterKey, sessEnc)
-	if err != nil || sess == "" {
+	if err != nil {
+		logUsage(instanceName, "cookies: decrypting sessionKey failed: %v", err)
+		return "", "", false
+	}
+	if sess == "" {
+		logUsage(instanceName, "cookies: sessionKey decrypted to empty string")
 		return "", "", false
 	}
 	org, err := decryptCookieValue(masterKey, orgEnc)
-	if err != nil || org == "" {
+	if err != nil {
+		logUsage(instanceName, "cookies: decrypting lastActiveOrg failed: %v", err)
+		return "", "", false
+	}
+	if org == "" {
+		logUsage(instanceName, "cookies: lastActiveOrg decrypted to empty string")
 		return "", "", false
 	}
 	return sess, org, true
