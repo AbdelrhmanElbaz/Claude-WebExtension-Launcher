@@ -25,6 +25,7 @@ package ui
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -263,8 +264,12 @@ func readEncryptedCookies(instanceName string) (sessionKeyEnc, orgIDEnc []byte, 
 	}
 	defer db.Close()
 
+	// Select host_key too, purely for diagnostics below — if a name shows
+	// up more than once (different subdomains, stale/expired duplicate
+	// rows, etc.) we currently just take whichever the loop sees last,
+	// which is a real bug if that isn't the row we want.
 	rows, err := db.Query(
-		`SELECT name, encrypted_value FROM cookies
+		`SELECT name, host_key, encrypted_value FROM cookies
 		 WHERE host_key LIKE '%claude.ai' AND name IN ('sessionKey', 'lastActiveOrg')`,
 	)
 	if err != nil {
@@ -272,12 +277,19 @@ func readEncryptedCookies(instanceName string) (sessionKeyEnc, orgIDEnc []byte, 
 	}
 	defer rows.Close()
 
+	type match struct {
+		name, host string
+		val        []byte
+	}
+	var matches []match
+
 	for rows.Next() {
-		var name string
+		var name, host string
 		var val []byte
-		if err := rows.Scan(&name, &val); err != nil {
+		if err := rows.Scan(&name, &host, &val); err != nil {
 			continue
 		}
+		matches = append(matches, match{name, host, val})
 		switch name {
 		case "sessionKey":
 			sessionKeyEnc = val
@@ -285,6 +297,19 @@ func readEncryptedCookies(instanceName string) (sessionKeyEnc, orgIDEnc []byte, 
 			orgIDEnc = val
 		}
 	}
+
+	// Diagnostics: dump every matching row's name/host/length/hash so a
+	// duplicate-row or wrong-row bug (multiple 'sessionKey' rows across
+	// subdomains, an unrelated same-named cookie, etc.) is visible
+	// directly instead of us having to guess from the decrypted garbage.
+	for _, m := range matches {
+		sum := sha256.Sum256(m.val)
+		logUsage(instanceName, "cookies: row name=%q host=%q len=%d sha256=%x", m.name, m.host, len(m.val), sum[:8])
+	}
+	if len(matches) == 0 {
+		logUsage(instanceName, "cookies: query returned zero rows for sessionKey/lastActiveOrg under host_key LIKE '%%claude.ai'")
+	}
+
 	return sessionKeyEnc, orgIDEnc, rows.Err()
 }
 
