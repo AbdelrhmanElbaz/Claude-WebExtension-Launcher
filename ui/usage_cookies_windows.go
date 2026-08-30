@@ -33,6 +33,7 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 	"unsafe"
 
 	_ "modernc.org/sqlite"
@@ -117,6 +118,34 @@ func loadMasterKey(instanceName string) ([]byte, error) {
 // decryptCookieValue undoes Chromium's per-cookie AES-256-GCM encryption.
 // Cookies written before any encryption existed (or already plaintext for
 // some other reason) have no v10/v20 prefix — returned as-is in that case.
+// isCleanCookieText reports whether s looks like a real Chromium cookie
+// value: printable ASCII only, no control/binary bytes. A cookie that
+// fails this check means something upstream of the crypto (WAL
+// consistency, wrong row, wrong offset) handed us bad bytes even though
+// GCM's own tag check passed — GCM authenticates whatever bytes it was
+// given, it can't tell us those bytes were the wrong row's data.
+func isCleanCookieText(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 || c > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
+// hexPreview renders up to n bytes of s as hex, for logging garbage values
+// without dumping an entire (possibly sensitive) cookie into the log file.
+func hexPreview(s string, n int) string {
+	if len(s) > n {
+		s = s[:n]
+	}
+	return fmt.Sprintf("% x", s)
+}
+
 func decryptCookieValue(masterKey, encrypted []byte) (string, error) {
 	const prefixLen = 3
 	const nonceLen = 12
@@ -154,7 +183,28 @@ func decryptCookieValue(masterKey, encrypted []byte) (string, error) {
 // lock-avoidance trick used for LevelDB earlier: Network\Cookies is a live
 // SQLite database that may be open (in WAL/journal mode) by a running
 // claude.exe, but a plain byte-for-byte copy doesn't need an exclusive lock.
+//
+// Retries a handful of times on failure: an actively-used profile can hold
+// a brief exclusive lock while Chromium checkpoints the WAL, and that
+// window is usually gone within a few hundred ms.
 func copySingleFile(src string) (path string, cleanup func(), err error) {
+	const maxAttempts = 5
+	const retryDelay = 150 * time.Millisecond
+
+	var data []byte
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		data, err = os.ReadFile(src)
+		if err == nil {
+			break
+		}
+		if attempt < maxAttempts {
+			time.Sleep(retryDelay)
+		}
+	}
+	if err != nil {
+		return "", func() {}, fmt.Errorf("read %s after %d attempts: %w", src, maxAttempts, err)
+	}
+
 	tmp, err := os.CreateTemp("", "claudewebext-cookies-*.sqlite")
 	if err != nil {
 		return "", func() {}, err
@@ -163,15 +213,37 @@ func copySingleFile(src string) (path string, cleanup func(), err error) {
 	tmp.Close()
 	cleanup = func() { os.Remove(tmpPath) }
 
-	data, err := os.ReadFile(src)
-	if err != nil {
-		cleanup()
-		return "", func() {}, err
-	}
 	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
 		cleanup()
 		return "", func() {}, err
 	}
+
+	// The main DB file alone is not a consistent snapshot while SQLite is
+	// running in WAL mode (the default for Chromium's Cookies DB): recent
+	// row changes live in the "-wal" sidecar until the next checkpoint,
+	// and reading the main file without it can hand the driver
+	// inconsistent page data — which showed up here as `encrypted_value`
+	// blobs that decrypted "successfully" (valid GCM tag) but with extra
+	// garbage bytes, since the value read was assembled from stale/
+	// overlapping page content rather than the actual current row. Copy
+	// the WAL and its "-shm" shared-memory index alongside the main file,
+	// best-effort — if a given instance was fully checkpointed and has no
+	// WAL file at all, that's a normal, harmless case, not an error.
+	for _, suffix := range []string{"-wal", "-shm"} {
+		sidecar := src + suffix
+		sidecarData, serr := os.ReadFile(sidecar)
+		if serr != nil {
+			continue // no WAL/SHM right now — fine, main file alone is consistent
+		}
+		_ = os.WriteFile(tmpPath+suffix, sidecarData, 0o600)
+	}
+	oldCleanup := cleanup
+	cleanup = func() {
+		oldCleanup()
+		os.Remove(tmpPath + "-wal")
+		os.Remove(tmpPath + "-shm")
+	}
+
 	return tmpPath, cleanup, nil
 }
 
@@ -244,8 +316,9 @@ func readSessionCookies(instanceName string) (sessionKey, orgID string, ok bool)
 		logUsage(instanceName, "cookies: decrypting sessionKey failed: %v", err)
 		return "", "", false
 	}
-	if sess == "" {
-		logUsage(instanceName, "cookies: sessionKey decrypted to empty string")
+	if !isCleanCookieText(sess) {
+		logUsage(instanceName, "cookies: sessionKey decrypted to non-text garbage (len=%d, first bytes: %s) — likely a stale/inconsistent DB read, not a real cookie value",
+			len(sess), hexPreview(sess, 24))
 		return "", "", false
 	}
 	org, err := decryptCookieValue(masterKey, orgEnc)
@@ -253,8 +326,9 @@ func readSessionCookies(instanceName string) (sessionKey, orgID string, ok bool)
 		logUsage(instanceName, "cookies: decrypting lastActiveOrg failed: %v", err)
 		return "", "", false
 	}
-	if org == "" {
-		logUsage(instanceName, "cookies: lastActiveOrg decrypted to empty string")
+	if !isCleanCookieText(org) {
+		logUsage(instanceName, "cookies: lastActiveOrg decrypted to non-text garbage (len=%d, first bytes: %s) — likely a stale/inconsistent DB read, not a real cookie value",
+			len(org), hexPreview(org, 24))
 		return "", "", false
 	}
 	return sess, org, true
