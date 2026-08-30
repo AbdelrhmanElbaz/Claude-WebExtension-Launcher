@@ -184,6 +184,27 @@ function setupPolyfills() {
             }
             return;
         }
+
+        // Usage export polyfill — writes a small per-instance JSON snapshot
+        // the Go launcher UI reads directly. No cookies, no crypto: this is
+        // literally the extension's own already-computed data, handed to us
+        // voluntarily via the same console-bridge used for alarms/notifications.
+        if (message.startsWith("CUT_USAGE:")) {
+            try {
+                const usageData = JSON.parse(message.substring("CUT_USAGE:".length));
+                const usageDir = path.join(app.getPath("appData"), "ClaudeWebExtLauncher", "usage");
+                fs.mkdirSync(usageDir, { recursive: true });
+                const outPath = path.join(usageDir, `${instanceName}.json`);
+                fs.writeFileSync(outPath, JSON.stringify({
+                    instance: instanceName,
+                    updatedAt: Date.now(),
+                    usageData
+                }, null, 2));
+            } catch (err) {
+                console.error("[Node] Failed to write usage export:", err);
+            }
+            return;
+        }
     });
 
     function fireAlarm(name) {
