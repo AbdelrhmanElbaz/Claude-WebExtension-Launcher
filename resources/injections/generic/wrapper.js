@@ -177,6 +177,17 @@ function setupPolyfills() {
             return;
         }
 
+        // Usage bridge: the "Launcher Usage Bridge" extension logs CUT_USAGE:{limits:{session,weekly}}
+        if (message.startsWith("CUT_USAGE:")) {
+            try {
+                const data = JSON.parse(message.substring("CUT_USAGE:".length));
+                if (typeof globalThis.__cutUsageBridge === "function") globalThis.__cutUsageBridge(data);
+            } catch (err) {
+                console.error("[Node] Bad CUT_USAGE message:", err);
+            }
+            return;
+        }
+
         // Alarm polyfill
         if (message.startsWith("CUT_ALARM:")) {
             console.log("[Node] Alarm command received:", message);
@@ -400,6 +411,15 @@ app.on("web-contents-created", (event, contents) => {
             console.error("[webext] Failed to write usage snapshot:", err);
         }
     }
+
+    // Called from the CUT_USAGE console bridge (Launcher Usage Bridge extension).
+    globalThis.__cutUsageBridge = data => {
+        const num = v => (typeof v === "number" ? v : null);
+        usage.fiveHour = num(data?.limits?.session?.percentage);
+        usage.weekly = num(data?.limits?.weekly?.percentage);
+        writeUsageSnapshot();
+        refresh();
+    };
 
     // copyItem turns a built MenuItem back into a template (keeping its click handler).
     function copyItem(item) {
