@@ -9,25 +9,29 @@ A custom installer for Claude Desktop that includes built-in extensions (and the
 - This project is neither affiliated with nor endorsed by Anthropic
 - You are responsible for ensuring your use complies with all applicable terms and agreements
 
-## Multi-instance (new)
+## Multi-instance
 
-You can now run multiple desktop client instances by just launching the client with --instance [name], eg --instance work.
-Useful if you want to have multiple windows open, or if you have multiple accounts.
+You can run several copies of the client side by side, each with its own login, settings and sessions. Useful if you want multiple windows open, or if you have multiple accounts.
+
+Turn on **Manage multiple instances** on the setup screen (shown on first launch, or with `--show-setup`). After its usual checks, the launcher then shows a list of your instances instead of launching straight away:
+- **Launch** starts an instance. The list stays open, so you can start several.
+- **Add instance** creates a new one.
+- **The cog** gives each instance its own applications-menu and startup entries (Windows and Linux), which launch it directly.
+- **The bin** removes an instance's data folder and shortcuts.
+- **Launcher settings** reopens the setup screen.
+
+The instance you've been using all along is **Main**. Its data folder was called `Claude-modified` before; the launcher renames it to `Claude-Main` the first time it runs while that instance is closed. Instances you already had are added to the list automatically.
+
+The launcher's own menu entry (plain "Claude Desktop (Extended)") opens the list. You can also skip the list and start an instance directly with `--instance <name>` (e.g. `--instance work`), which is what an instance's own entries ("Claude (work)") do.
 
 ## Known limitations
 
 ### Multi-instance login requires using a code
-When using `--instance` to run additional instances, those instances are not registered to handle Claude's magic links. When logging in to a non-default instance, use the **"Use a login code instead"** option to log in with a one-time code.
+Instances other than Main are not registered to handle Claude's magic links. When logging in to another instance, use the **"Use a login code instead"** option to log in with a one-time code.
 
 ### Windows requires admin perms
 This is to make Cowork function. The app will block cowork if the application is not inside of C:\Program Files\WindowsApps, which requires admin permissions to be written to and read from.
-
-### Cowork does not work on MacOS (Corrupt install)
-This is because the app is signed, and cowork checks for the signature.
-On windows, this is circumvented by not modifying the exe and instead using a .dll, but that cannot be done on MacOS.
-
-
-I would recommend keeping a separate, unmodified install for it.
+EDIT: This WAS to make Cowork function, but Anthropic has since removed the ability to run it locally. I may rework the launcher to remove the admin requirement in the future. But right now, I'd rather keep it all working.
 
 ## Overview
 
@@ -58,21 +62,51 @@ Not much I can do. I can't afford the subscription, and even if I could, this wo
 ### First Launch Network Service Crash (macOS only)
 On first launch, you might see a crash dialog about the network service. This is (likely) because the modified app needs Keychain permission to be granted, given that it uses an ad-hoc signature. Just ignore it.
 
-### Debug flag
+### Linux: password prompt on first launch (Ubuntu 24.04+)
+Ubuntu 24.04 and newer block the sandbox Claude relies on unless the app has an AppArmor profile. The official package installs one for its own location, so the launcher adds one for its install. That needs root once, so you'll be asked for your password on the first launch. Other distros don't need this and won't ask.
 
-If anything else happens or goes wrong, execute the launcher with the --debug flag to be able to see the full logs.
+### Logs and the debug flag
+
+If anything goes wrong, click **Open logs** in the launcher's window (it's there during the countdown and on errors). The log is `launcher.log` (or `launcher-<name>.log` for a named `--instance`) in `%LOCALAPPDATA%\ClaudeWebExtLauncher` on Windows, and in the launcher's data folder on macOS/Linux; the previous run's is kept as `launcher.previous.log`.
+
+Running the launcher with `--debug` skips the window and shows everything in the terminal instead, with Claude attached to it so its own output is visible too.
 
 ## Installation
 
 ### Supported Platforms
 - **macOS** - Intel and Apple Silicon
 - **Windows** - Windows 10/11 (x64 and ARM64)
+- **Linux** - x64 and ARM64 (uses Anthropic's official .deb, but works on any distro)
 
 > On Windows there's a single (x64) download — no need to pick an architecture. On an ARM64 PC
 > it detects the host and installs the native arm64 Claude automatically (Windows 11 on ARM).
 
 ### Quick Start
 Download the latest installer from [Releases](https://github.com/lugia19/Claude-WebExtension-Launcher/releases) and run it. The installer will handle everything automatically.
+
+On first run the launcher installs itself to a fixed place and runs from there from then on, so its shortcuts and updates always use the same path:
+
+| OS | Installed launcher |
+|---|---|
+| Windows | `%LOCALAPPDATA%\ClaudeWebExtLauncher\Claude_WebExtension_Launcher.exe` |
+| macOS | `~/Applications/Claude_WebExtension_Launcher.app` |
+| Linux | `~/.local/share/claude-webext-launcher/Claude_WebExtension_Launcher` |
+
+After that you can delete what you downloaded. Running a downloaded copy again simply hands over to the installed one, or replaces it first if the download is a newer version.
+
+### Uninstalling
+Open the launcher's settings (run it with `--show-setup`, or **Launcher settings** in the instance list) and click **Uninstall…**. On Windows it's also listed under Settings → Apps → Installed apps. Or run the launcher with `--uninstall`.
+
+It removes the launcher, the patched Claude, the shortcuts and everything else the launcher set up (on Windows: the Cowork service, which needs one administrator prompt; on Linux: the AppArmor profile, which needs your password). Your instances' data (logins, settings and local sessions) is kept unless you tick the box to delete it. Cowork and Code sessions shared with the official Claude app are given back to it first.
+
+On Linux, pick the `linux-amd64` or `linux-arm64` zip, extract it and run `Claude_WebExtension_Launcher`. The modified Claude and its extensions are kept in `~/.local/share/claude-webext-launcher` too.
+
+### Applications menu and startup
+On first launch the launcher asks whether to add itself to the applications menu (the Start Menu on Windows) and whether to start when you log in. To change your mind later, run it with `--show-setup` to get the same screen again. Instances can have their own entries too, from the cog in the instance list (see [Multi-instance](#multi-instance)).
+
+On macOS the launcher itself is in your Applications folder (`~/Applications`) once it has run, so it only asks about starting at login. An instance's applications-menu entry is a small "Claude (name)" app next to it, which shows up in Launchpad and Spotlight and can go in the Dock.
+
+On Linux, the launcher also registers itself for `claude://` links, so magic-link login opens in the modified app.
 
 ## Features
 
@@ -101,4 +135,4 @@ The installer only creates a local modified Claude Desktop installation. No data
 If you encounter issues:
 - Ensure you have the latest version of the installer
 - Check that your system meets the platform requirements
-- The extended installation can be completely removed by deleting the installation folder
+- The extended installation can be removed completely with **Uninstall…** (see [Uninstalling](#uninstalling))

@@ -1,15 +1,15 @@
 package patcher
 
 import (
+	"bytes"
 	"claude-webext-patcher/asar"
 	"claude-webext-patcher/utils"
 	"embed"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -34,25 +34,16 @@ const (
 	// .nupkg does not contain. The arch is the native host arch (see HostArch), so an
 	// emulated amd64 launcher on ARM64 still provisions native arm64 Claude.
 	windowsMSIXRedirectURLFmt = "https://claude.ai/api/desktop/win32/%s/msix/latest/redirect"
-	macosReleasesURL          = "https://downloads.claude.ai/releases/darwin/universal/RELEASES.json"
 	appFolderName             = "app-latest"
-	KeepDownloadedArchive     = false
-	PatchVersion              = "13"
+	PatchVersion              = "16"
 )
-
-type MacOSManifest struct {
-	CurrentRelease string `json:"currentRelease"`
-	Releases       []struct {
-		Version  string `json:"version"`
-		UpdateTo struct {
-			URL string `json:"url"`
-		} `json:"updateTo"`
-	} `json:"releases"`
-}
 
 type Patch struct {
 	Files   []string
 	Exclude []string
+	// All applies the patch to every matching file; otherwise it stops at the first
+	// file it changes.
+	All bool
 	// Func returns the (possibly modified) content and whether it actually
 	// changed anything. A false modified return means "not applicable to this
 	// file" — the caller keeps looking through the remaining matched files.
@@ -70,14 +61,16 @@ var supportedVersions = map[string][]Patch{
 			Exclude: []string{"index.pre", "wrapper"},
 			Func:    patchProtocolArray,
 		},
+		{
+			// index.pre.js holds the startup check, a chunk the runtime copy.
+			Files:   []string{".vite/build/*.js"},
+			Exclude: []string{"wrapper"},
+			All:     true,
+			Func:    patchDevModeGate,
+		},
 	},
 	// Add version-specific overrides here when needed
 }
-
-// Cached verified versions list (loaded on first use)
-var versionsVerifiedGenericCompatible []string
-
-const verifiedVersionsURL = "https://raw.githubusercontent.com/lugia19/Claude-WebExtension-Launcher/master/resources/verified_versions.json"
 
 var (
 	AppFolder       string
@@ -90,66 +83,16 @@ func init() {
 	initPaths()
 }
 
+// CurrentAppFolder is the current install's folder, looked up afresh: another process
+// (this launcher's worker, or another launcher's) may have installed a new version
+// into a new folder since AppFolder was set (see newAppFolder). The launcher uses it
+// for everything that runs Claude.
+func CurrentAppFolder() string {
+	return currentAppFolder()
+}
+
 func InstallBaseDir() string {
 	return installBaseDir
-}
-
-// ForceRedownload deletes the version file and forces a full re-download and re-patch.
-func ForceRedownload() error {
-	claudeVersionFile := filepath.Join(installBaseDir, "claude-version.txt")
-	os.Remove(claudeVersionFile)
-	return EnsurePatched(true)
-}
-
-// Load verified versions from GitHub, with fallback to embedded JSON
-func loadVerifiedVersions() []string {
-	// Try fetching from GitHub first
-	resp, err := http.Get(verifiedVersionsURL)
-	if err == nil {
-		defer resp.Body.Close()
-		if resp.StatusCode == 200 {
-			body, err := io.ReadAll(resp.Body)
-			if err == nil {
-				var versions []string
-				if err := json.Unmarshal(body, &versions); err == nil {
-					fmt.Printf("Loaded %d verified versions from GitHub\n", len(versions))
-					return versions
-				}
-			}
-		}
-	}
-
-	// Fallback to embedded JSON
-	fmt.Println("Falling back to embedded verified versions list")
-	embeddedData, err := EmbeddedFS.ReadFile("resources/verified_versions.json")
-	if err != nil {
-		fmt.Printf("Warning: Could not load embedded verified versions: %v\n", err)
-		return []string{}
-	}
-
-	var versions []string
-	if err := json.Unmarshal(embeddedData, &versions); err != nil {
-		fmt.Printf("Warning: Could not parse embedded verified versions: %v\n", err)
-		return []string{}
-	}
-
-	fmt.Printf("Loaded %d verified versions from embedded file\n", len(versions))
-	return versions
-}
-
-// Check if a version is verified to work with generic patches
-func IsVersionVerified(version string) bool {
-	// Load versions on first use
-	if versionsVerifiedGenericCompatible == nil {
-		versionsVerifiedGenericCompatible = loadVerifiedVersions()
-	}
-
-	for _, v := range versionsVerifiedGenericCompatible {
-		if v == version {
-			return true
-		}
-	}
-	return false
 }
 
 func DeploySentinelExtension() error {
@@ -172,6 +115,9 @@ func DeploySentinelExtension() error {
 
 // patchProtocolArray adds "chrome-extension:" to the allowed protocols array.
 // Matches the prefix ["devtools:","file:" and inserts before the closing ].
+// The Windows/macOS bundles quote the entries with double quotes; the Linux bundle
+// uses template-literal backticks ([`devtools:`,`file:`,...]), so both are tried and
+// the inserted entry reuses whichever quote matched.
 //
 // Claude's bundle is heavily code-split, so this runs against many chunk files
 // and only one contains the array. "Prefix not found" is therefore the normal
@@ -180,32 +126,92 @@ func DeploySentinelExtension() error {
 func patchProtocolArray(content []byte) ([]byte, bool) {
 	contentStr := string(content)
 
-	prefix := `["devtools:","file:"`
-	idx := strings.Index(contentStr, prefix)
-	if idx == -1 {
-		return content, false
+	for _, q := range []string{`"`, "`"} {
+		prefix := "[" + q + "devtools:" + q + "," + q + "file:" + q
+		idx := strings.Index(contentStr, prefix)
+		if idx == -1 {
+			continue
+		}
+
+		// Find the closing ] after the prefix
+		closingIdx := strings.Index(contentStr[idx:], "]")
+		if closingIdx == -1 {
+			fmt.Println("Warning: Could not find closing ] for protocol array")
+			debugPause()
+			return content, false
+		}
+		closingIdx += idx
+
+		// Check if chrome-extension: is already present
+		arrayContent := contentStr[idx : closingIdx+1]
+		if strings.Contains(arrayContent, "chrome-extension:") {
+			fmt.Println("Protocol array already contains chrome-extension:, skipping")
+			return content, false
+		}
+
+		// Insert ,"chrome-extension:" before the ]
+		contentStr = contentStr[:closingIdx] + "," + q + "chrome-extension:" + q + contentStr[closingIdx:]
+		fmt.Println("Added chrome-extension: to protocol array")
+		return []byte(contentStr), true
 	}
 
-	// Find the closing ] after the prefix
-	closingIdx := strings.Index(contentStr[idx:], "]")
-	if closingIdx == -1 {
-		fmt.Println("Warning: Could not find closing ] for protocol array")
-		debugPause()
+	return content, false
+}
+
+// devModeGate is what patchDevModeGate inserts: the check passes when wrapper.js has
+// seen the launcher's --webext-dev-mode.
+const devModeGate = "if(globalThis.__webextDevMode)return!0;"
+
+// functionStart matches the start of a minified function with no parameters, up to its
+// opening brace.
+var functionStart = regexp.MustCompile(`function\s*[\w$]+\(\)\{`)
+
+// patchDevModeGate makes Claude's E2E token checks pass in developer mode. Each one is
+// a function that starts by reading process.env.CLAUDE_CDP_AUTH (a signed, short-lived
+// token for Anthropic's test harness), so it's found by that read rather than by its
+// minified name: the closest function start before the read, with nothing between
+// them but a variable declaration. Other uses of the variable (inline in a larger
+// function) aren't preceded by one and are left alone. All matches are patched, as the
+// check is duplicated across bundle files.
+func patchDevModeGate(content []byte) ([]byte, bool) {
+	const read = "process.env.CLAUDE_CDP_AUTH"
+	if !bytes.Contains(content, []byte(read)) {
+		return content, false // most bundle files: skip copying them to a string
+	}
+	s := string(content)
+	var out strings.Builder
+	last, count := 0, 0
+	for searchFrom := 0; ; {
+		idx := strings.Index(s[searchFrom:], read)
+		if idx == -1 {
+			break
+		}
+		idx += searchFrom
+		searchFrom = idx + len(read)
+
+		// Only the text shortly before the read can hold its function's start.
+		windowStart := max(last, idx-200)
+		starts := functionStart.FindAllStringIndex(s[windowStart:idx], -1)
+		if len(starts) == 0 {
+			continue
+		}
+		bodyStart := windowStart + starts[len(starts)-1][1]
+		// Also skips an already patched function: the gate has parentheses.
+		gap := s[bodyStart:idx]
+		if len(gap) > 80 || strings.ContainsAny(gap, "{}();") || strings.Contains(gap, "=>") {
+			continue
+		}
+		out.WriteString(s[last:bodyStart])
+		out.WriteString(devModeGate)
+		last = bodyStart
+		count++
+	}
+	if count == 0 {
 		return content, false
 	}
-	closingIdx += idx
-
-	// Check if chrome-extension: is already present
-	arrayContent := contentStr[idx : closingIdx+1]
-	if strings.Contains(arrayContent, "chrome-extension:") {
-		fmt.Println("Protocol array already contains chrome-extension:, skipping")
-		return content, false
-	}
-
-	// Insert ,"chrome-extension:" before the ]
-	contentStr = contentStr[:closingIdx] + `,"chrome-extension:"` + contentStr[closingIdx:]
-	fmt.Println("Added chrome-extension: to protocol array")
-	return []byte(contentStr), true
+	out.WriteString(s[last:])
+	fmt.Printf("Added the developer mode gate to %d function(s)\n", count)
+	return []byte(out.String()), true
 }
 
 // installWrapper copies the wrapper.js into the unpacked asar and redirects
@@ -231,6 +237,7 @@ func installWrapper(tempDir string, version string) error {
 
 	pkg["main"] = ".vite/build/wrapper.js"
 	pkg["_originalMain"] = originalMain
+	adjustPackageJSON(pkg)
 
 	newPkgData, err := json.MarshalIndent(pkg, "", "  ")
 	if err != nil {
@@ -264,159 +271,99 @@ func installWrapper(tempDir string, version string) error {
 	return nil
 }
 
-func canFallbackToExisting() bool {
-	_, err := os.Stat(appExePath)
-	return err == nil
-}
-
-const stagingSuffix = ".staging"
-
-// buildAndSwap downloads and patches a fresh Claude into a staging folder, then
-// atomically swaps it into place as AppFolder. The live install is never touched
-// until the final swap, so a failed/interrupted patch (or a locked claude.exe held
+// buildAndInstall downloads and patches a fresh Claude into a new folder
+// (newAppFolder), then makes it the install (commitAppFolder). The live install is
+// never touched until then, so a failed/interrupted patch (or a locked claude.exe held
 // by a running instance) leaves the previous working install intact rather than a
-// half-written or stock one. On return the app-folder globals point back at the real
-// install, so canFallbackToExisting() checks the right place.
-func buildAndSwap(version, downloadURL string) error {
-	realApp := AppFolder
-	staging := realApp + stagingSuffix
+// half-written or stock one. On return the app-folder globals point at whichever
+// folder holds the install.
+func buildAndInstall(version, downloadURL string) error {
+	previous := AppFolder
+	folder := newAppFolder(version)
+	setAppPaths(folder) // build everything into the new folder
 
-	os.RemoveAll(staging) // clear any leftover from a previous aborted run
-	setAppPaths(staging)  // build everything into the staging folder
-	defer setAppPaths(realApp)
-
-	if err := downloadAndExtract(version, downloadURL); err != nil {
-		os.RemoveAll(staging)
-		return err
+	err := downloadAndExtract(version, downloadURL)
+	if err == nil {
+		err = applyPatches(version)
 	}
-	if err := applyPatches(version); err != nil {
-		os.RemoveAll(staging)
-		return err
+	installed := previous
+	if err == nil {
+		installed, err = commitAppFolder(folder, previous)
 	}
-	if err := swapAppFolder(staging, realApp); err != nil {
-		os.RemoveAll(staging)
-		return err
+	if err != nil {
+		os.RemoveAll(folder)
 	}
-	return nil
+	setAppPaths(installed)
+	return err
 }
 
-// swapAppFolder replaces target with staging via two renames (os.Rename cannot
-// atomically replace an existing directory on Windows). The window where target is
-// absent is a couple of fast metadata ops. If moving the old install aside fails
-// (e.g. a running claude.exe holds a lock), the old install is left in place.
-func swapAppFolder(staging, target string) error {
-	backup := target + ".old"
-	os.RemoveAll(backup)
-
-	if _, err := os.Stat(target); err == nil {
-		if err := os.Rename(target, backup); err != nil {
-			return fmt.Errorf("moving old install aside (is Claude still running?): %w", err)
-		}
-	}
-
-	if err := os.Rename(staging, target); err != nil {
-		// Roll the old install back so we're never left without one.
-		if _, berr := os.Stat(backup); berr == nil {
-			os.Rename(backup, target)
-		}
-		return fmt.Errorf("swapping in new install: %w", err)
-	}
-
-	os.RemoveAll(backup)
-	return nil
+// ClaudeUpdate is the launcher's view of whether Claude needs (re)building.
+type ClaudeUpdate struct {
+	Installed string // installed version, "" if none
+	Latest    string
+	URL       string
+	Needed    bool
+	Reason    string // why it's needed, for the log
 }
 
-func EnsurePatched(forceUpdate bool) error {
+// CheckClaude compares the install with the latest release. A new version, a changed
+// PatchVersion (the injections changed) or force all mean a rebuild. If the latest
+// release can't be determined, the error is returned alongside what is installed.
+func CheckClaude(force bool) (ClaudeUpdate, error) {
+	u := ClaudeUpdate{Installed: readVersionFile("claude-version.txt")}
+	if u.Installed != "" {
+		fmt.Printf("Current version: %s\n", u.Installed)
+	}
+
+	latest, url, err := GetLatestVersion()
+	if err != nil {
+		return u, err
+	}
+	u.Latest, u.URL = latest, url
+	fmt.Printf("Latest version: %s\n", latest)
+
+	switch {
+	case u.Installed == "":
+		u.Needed, u.Reason = true, "not installed"
+	case u.Installed != latest:
+		u.Needed, u.Reason = true, "new version"
+	case readVersionFile("patch-version.txt") != PatchVersion:
+		u.Needed, u.Reason = true, "patch changed"
+	case force:
+		u.Needed, u.Reason = true, "forced"
+	}
+	return u, nil
+}
+
+// Install builds a patched Claude version from the package the launcher downloaded
+// (PrefetchedPackage), makes it the install, and records it. Only then are the version
+// files written, so an interrupted build can never leave a "patched" marker on a stock
+// or half-built app. Runs in the worker.
+func Install(version, url string) error {
 	if err := prepareInstallDir(); err != nil {
 		return fmt.Errorf("setting up install directory: %v", err)
 	}
-
-	// Get current version (stored at installBaseDir level, not inside AppFolder)
-	currentVersion := ""
-	claudeVersionFile := filepath.Join(installBaseDir, "claude-version.txt")
-	if data, err := os.ReadFile(claudeVersionFile); err == nil {
-		currentVersion = strings.TrimSpace(string(data))
-		fmt.Printf("Current version: %s\n", currentVersion)
+	if err := buildAndInstall(version, url); err != nil {
+		return err
 	}
-
-	// Get latest version and download URL
-	newestVersion, downloadURL, err := GetLatestVersion()
-	if err != nil {
-		// If we have an existing installation, continue using it
-		if currentVersion != "" {
-			fmt.Printf("Warning: %v\n", err)
-			fmt.Printf("Continuing with existing installation (version %s)\n", currentVersion)
-			debugPause()
-
-			// Check if the app executable exists
-			if _, err := os.Stat(appExePath); os.IsNotExist(err) {
-				return fmt.Errorf("existing installation is incomplete (executable not found)")
-			}
-
-			return nil // Continue with existing installation
-		}
-		// No existing installation and no version available
-		return fmt.Errorf("no versions available and no existing installation found")
-	}
-
-	fmt.Printf("Latest version: %s\n", newestVersion)
-
-	// Update to the latest version, or rebuild in place when forced (the
-	// --force-update recovery path re-applies a lost/corrupted patch even when the
-	// Claude version is unchanged).
-	versionChanged := currentVersion != newestVersion
-	shouldUpdate := forceUpdate || versionChanged
-	if versionChanged {
-		if !IsVersionVerified(newestVersion) {
-			fmt.Printf("Note: Version %s has not been explicitly verified, but should work fine.\n", newestVersion)
-			fmt.Println("If you run into issues, let me know on GitHub.")
-		}
-	}
-
-	patchVersionFile := filepath.Join(installBaseDir, "patch-version.txt")
-	if shouldUpdate {
-		if versionChanged {
-			fmt.Printf("Updating to %s...\n", newestVersion)
-		} else {
-			fmt.Printf("Re-applying patch for %s...\n", newestVersion)
-		}
-
-		if err := buildAndSwap(newestVersion, downloadURL); err != nil {
-			if canFallbackToExisting() {
-				fmt.Printf("Warning: update failed (%v), continuing with existing installation.\n", err)
-				debugPause()
-				return nil
-			}
-			return err
-		}
-		// Record success only after the new install is fully built and swapped in,
-		// so an interrupted patch can never leave a stale "patched" marker on a stock app.
-		os.WriteFile(claudeVersionFile, []byte(newestVersion), 0644)
-		os.WriteFile(patchVersionFile, []byte(PatchVersion), 0644)
-	} else {
-		fmt.Println("Already on the latest version")
-
-		// Injection code changed but the Claude version didn't — re-patch.
-		currentPatchVersion := ""
-		if data, err := os.ReadFile(patchVersionFile); err == nil {
-			currentPatchVersion = strings.TrimSpace(string(data))
-		}
-		if currentPatchVersion != PatchVersion {
-			fmt.Printf("Patch version changed (%s -> %s), re-patching...\n", currentPatchVersion, PatchVersion)
-			if err := buildAndSwap(newestVersion, downloadURL); err != nil {
-				if canFallbackToExisting() {
-					fmt.Printf("Warning: re-patching failed (%v), continuing with existing installation.\n", err)
-					debugPause()
-					return nil
-				}
-				return err
-			}
-			os.WriteFile(claudeVersionFile, []byte(newestVersion), 0644)
-			os.WriteFile(patchVersionFile, []byte(PatchVersion), 0644)
-		}
-	}
-
+	os.WriteFile(filepath.Join(installBaseDir, "claude-version.txt"), []byte(version), 0644)
+	os.WriteFile(filepath.Join(installBaseDir, "patch-version.txt"), []byte(PatchVersion), 0644)
 	return nil
+}
+
+// IsInstalled reports whether version is installed and patched with the current
+// PatchVersion, e.g. because another launcher installed it in the meantime.
+func IsInstalled(version string) bool {
+	return readVersionFile("claude-version.txt") == version &&
+		readVersionFile("patch-version.txt") == PatchVersion
+}
+
+func readVersionFile(name string) string {
+	data, err := os.ReadFile(filepath.Join(installBaseDir, name))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
 }
 
 func applyPatches(version string) error {
@@ -440,7 +387,9 @@ func applyPatches(version string) error {
 	}
 
 	asarPath := filepath.Join(appResourcesDir, "app.asar")
-	tempDir := utils.ResolvePath("asar-temp")
+	// Under the install folder: on Windows the elevated worker extracts and deletes this,
+	// and the launcher-local folder (utils.ResolvePath) is user-writable.
+	tempDir := filepath.Join(installBaseDir, "asar-temp")
 
 	// Unpack asar
 	fmt.Println("Unpacking asar...")
@@ -457,10 +406,12 @@ func applyPatches(version string) error {
 	}
 
 	// Apply content patches (e.g. protocol array)
+	modifiedFiles := map[string]bool{}
 	for i, patch := range patches {
 		fmt.Printf("Applying content patch %d/%d...\n", i+1, len(patches))
 
 		patchApplied := false
+	files:
 		for _, filePattern := range patch.Files {
 			pattern := filepath.Join(tempDir, filePattern)
 			matches, err := filepath.Glob(pattern)
@@ -501,11 +452,10 @@ func applyPatches(version string) error {
 					continue
 				}
 				patchApplied = true
-				break
-			}
-
-			if patchApplied {
-				break
+				modifiedFiles[matchedFile] = true
+				if !patch.All {
+					break files
+				}
 			}
 		}
 
@@ -514,6 +464,8 @@ func applyPatches(version string) error {
 			debugPause()
 		}
 	}
+
+	removeCompileCache(tempDir, modifiedFiles)
 
 	// Backup original and repack
 	os.Rename(asarPath, asarPath+".backup")
@@ -532,6 +484,24 @@ func applyPatches(version string) error {
 
 	fmt.Println("Patches applied successfully!")
 	return nil
+}
+
+// removeCompileCache deletes the precompiled V8 code of the bundle files we changed.
+// Claude ships it as compile-cache/<file>.<arch>.jsc, next to .vite. V8 only checks it
+// against the source's length, so after a patch that kept a file's length it would run
+// the unpatched code; otherwise it's rejected on every start, which only costs time.
+func removeCompileCache(asarRoot string, modified map[string]bool) {
+	for file := range modified {
+		// Bundle file names are hashes of [A-Za-z0-9_-], so nothing to escape.
+		caches, _ := filepath.Glob(filepath.Join(asarRoot, "compile-cache", filepath.Base(file)+".*.jsc"))
+		for _, cache := range caches {
+			if err := os.Remove(cache); err != nil {
+				fmt.Printf("Warning: could not remove %s: %v\n", cache, err)
+				continue
+			}
+			fmt.Printf("Removed compile-cache/%s\n", filepath.Base(cache))
+		}
+	}
 }
 
 func replaceIcons() error {

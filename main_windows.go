@@ -3,225 +3,110 @@
 package main
 
 import (
-	"claude-webext-patcher/extensions"
 	"claude-webext-patcher/patcher"
 	"claude-webext-patcher/utils"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
 const (
-	// patchLockName serializes the elevated patcher across concurrently-launched
+	// patchLockName serializes the elevated worker across concurrently-launched
 	// instances (all run as the same user in one session, so Local\ is shared).
 	patchLockName = `Local\ClaudeWebExtLauncher-Patch`
-	// patchLockTimeout is generous: a real patch downloads the ~222 MB MSIX.
+	// patchLockTimeout is generous: a real update downloads the ~222 MB MSIX.
 	patchLockTimeout = 5 * time.Minute
+	// workerStartingNote is a row's note until the worker reports on it: it's
+	// started through UAC.
+	workerStartingNote = "waiting for permission"
+	// nodeInspectorSupported: version.dll turns on Electron's --inspect fuse for the
+	// launch options' Node inspector.
+	nodeInspectorSupported = true
 )
 
-// prepareAdminContext cleans up old installation files from the launcher directory.
-// Unlike before Phase 2, this no longer self-elevates — elevation is handled
-// on-demand by ensureClaudeReady when admin work is actually needed.
-func prepareAdminContext() error {
-	execDir := utils.GetExecutableDir()
-	for _, oldDir := range []string{"app-latest", "web-extensions"} {
-		oldPath := filepath.Join(execDir, oldDir)
-		if _, err := os.Stat(oldPath); err == nil {
-			fmt.Printf("Removing old %s from launcher directory...\n", oldDir)
-			if err := os.RemoveAll(oldPath); err != nil {
-				fmt.Printf("Warning: could not remove %s: %v\n", oldPath, err)
+// platformSetup cleans up files older launcher versions left next to the executable:
+// this one, and the downloaded copy that handed over to it (installedFrom), which is
+// where those versions ran from.
+func platformSetup(installedFrom string) {
+	dirs := []string{utils.GetExecutableDir()}
+	if installedFrom != "" {
+		dirs = append(dirs, filepath.Dir(installedFrom))
+	}
+	for _, dir := range dirs {
+		for _, oldDir := range []string{"app-latest", "web-extensions"} {
+			oldPath := filepath.Join(dir, oldDir)
+			if _, err := os.Stat(oldPath); err == nil {
+				fmt.Printf("Removing old %s from %s...\n", oldDir, dir)
+				if err := os.RemoveAll(oldPath); err != nil {
+					fmt.Printf("Warning: could not remove %s: %v\n", oldPath, err)
+				}
 			}
 		}
 	}
-	return nil
 }
-
-// releaseAdminContext is a no-op — ownership is managed by the patcher subprocess.
-func releaseAdminContext() {}
 
 func claudeUserDataDir(instance string) string {
 	return filepath.Join(os.Getenv("APPDATA"), "Claude-"+instance)
 }
 
 func claudeExecutablePath() string {
-	return filepath.Join(patcher.AppFolder, "claude.exe")
+	return filepath.Join(patcher.CurrentAppFolder(), "claude.exe")
 }
 
-// runPatcherMode runs the elevated patcher code path. Called when the launcher
-// is re-invoked with --patcher via UAC.
-func runPatcherMode(forceUpdate bool, debug bool) int {
-	fmt.Println("Running in elevated patcher mode...")
+// startClaude starts Claude (cmd, whose Env already includes env) and returns.
+func startClaude(cmd *exec.Cmd, env []string) error { return cmd.Start() }
 
-	if err := patcher.TakeWindowsAppsOwnership(); err != nil {
-		fmt.Printf("Failed to take WindowsApps ownership: %v\n", err)
-		fmt.Println("Press Enter to exit...")
-		fmt.Scanln()
-		return 1
-	}
-
-	if err := patcher.EnsurePatched(forceUpdate); err != nil {
-		fmt.Printf("Patching failed: %v\n", err)
-		patcher.ReleaseWindowsAppsOwnership()
-		fmt.Println("Press Enter to exit...")
-		fmt.Scanln()
-		return 1
-	}
-
-	if err := extensions.UpdateAll(); err != nil {
-		fmt.Printf("Warning: extension update failed: %v\n", err)
-		if debug {
-			fmt.Println("Press Enter to continue...")
-			fmt.Scanln()
-		}
-	}
-
-	if err := patcher.DeploySentinelExtension(); err != nil {
-		fmt.Printf("Warning: sentinel extension deployment failed: %v\n", err)
-		if debug {
-			fmt.Println("Press Enter to continue...")
-			fmt.Scanln()
-		}
-	}
-
-	patcher.GrantUserReadAccess()
-
-	if err := patcher.RegisterCoworkService(); err != nil {
-		fmt.Printf("Warning: Cowork service registration failed: %v\n", err)
-		if debug {
-			fmt.Println("Press Enter to continue...")
-			fmt.Scanln()
-		}
-	}
-
-	patcher.ReleaseWindowsAppsOwnership()
-
-	fmt.Println("Patching complete.")
-	if debug {
-		fmt.Println("Press Enter to exit...")
-		fmt.Scanln()
-	}
-	return 0
+// ensureConsole attaches or opens a console for output (the build is GUI-subsystem).
+func ensureConsole() {
+	utils.EnsureConsole()
 }
 
-// ensureClaudeReady checks whether admin work is needed and, if so, invokes
-// the launcher in elevated patcher mode via UAC.
-//
-// When a patch is actually needed, it is serialized behind a cross-process lock so
-// that launching many instances at once (e.g. a 10-instance batch template) can't
-// spawn 10 elevated patchers that race and corrupt the shared install. The first
-// instance patches (one UAC prompt); the rest block, then re-check and skip.
-func ensureClaudeReady(forceUpdate bool) error {
-	// Fast path: if nothing needs patching, don't take the lock — let the common
-	// case stay fully concurrent (this check is read-only + a version query).
-	if !checkNeedsAdmin(forceUpdate) {
-		fmt.Println("Claude is up to date, no admin work needed.")
-		return nil
-	}
+// The sandbox (AppArmor) step is Linux-only.
+func sandboxNeeded() bool   { return false }
+func installSandbox() error { return nil }
 
-	// A patch is needed: serialize it.
-	lock, locked := utils.AcquirePatchLock(patchLockName, patchLockTimeout)
-	if locked {
-		defer lock.Release()
-		// Re-check under the lock — another instance may have just finished patching.
-		if !checkNeedsAdmin(forceUpdate) {
-			fmt.Println("Claude was patched by another instance; continuing.")
-			return nil
-		}
-	} else if claudeInstalled() {
-		// Waited past the timeout for another instance. The atomic staging-swap
-		// guarantees the install is never left stock/half-written, so launching
-		// whatever is present is safe.
-		fmt.Println("Warning: timed out waiting for another instance to finish patching; launching existing installation.")
-		return nil
-	}
-	// If we couldn't lock AND there's no install yet, fall through and patch anyway.
+// coworkNeeded reports whether the Cowork service still has to be registered.
+func coworkNeeded() bool {
+	return !patcher.CoworkServiceExists()
+}
 
+// startWorker runs the worker elevated through UAC (the install lives in
+// C:\Program Files\WindowsApps) and returns its exit code. The build is GUI-subsystem,
+// so the worker opens no window; it writes to the log file itself.
+func startWorker(args []string) (int, error) {
 	exe, err := os.Executable()
 	if err != nil {
-		return fmt.Errorf("failed to get executable path: %v", err)
+		return -1, err
 	}
-
-	args := "--patcher"
-	if forceUpdate {
-		args += " --force-update"
+	quoted := make([]string, len(args))
+	for i, a := range args {
+		quoted[i] = syscall.EscapeArg(a)
 	}
-	if launchClaudeInTerminal {
-		args += " --debug"
-	}
-
-	fmt.Println("Administrator privileges required for patching...")
-	exitCode, err := utils.RunElevatedAndWait(exe, args)
-	if err != nil {
-		// UAC denied or ShellExecuteEx failed
-		if claudeInstalled() {
-			fmt.Printf("Warning: elevation failed (%v), launching existing installation.\n", err)
-			return nil
-		}
-		return fmt.Errorf("elevation failed and no existing installation: %v", err)
-	}
-
-	if exitCode != 0 {
-		if claudeInstalled() {
-			fmt.Printf("Warning: patcher exited with code %d, launching existing installation.\n", exitCode)
-			return nil
-		}
-		return fmt.Errorf("patcher failed (exit code %d) and no existing installation", exitCode)
-	}
-
-	return nil
+	return utils.RunElevatedAndWait(exe, strings.Join(quoted, " "))
 }
 
-// checkNeedsAdmin determines whether the elevated patcher needs to run.
-func checkNeedsAdmin(forceUpdate bool) bool {
-	if forceUpdate {
-		return true
-	}
-
-	// If the Cowork service is missing, run the elevated patcher (which registers it).
-	// Checked before any network call so it works offline too.
-	if !patcher.CoworkServiceExists() {
-		return true
-	}
-
-	installDir := patcher.InstallBaseDir()
-
-	// Check if Claude is installed
-	claudeVersionFile := filepath.Join(installDir, "claude-version.txt")
-	currentVersionData, err := os.ReadFile(claudeVersionFile)
-	if err != nil {
-		return true
-	}
-	currentVersion := strings.TrimSpace(string(currentVersionData))
-
-	// Check patch version
-	patchVersionFile := filepath.Join(installDir, "patch-version.txt")
-	patchData, err := os.ReadFile(patchVersionFile)
-	if err != nil || strings.TrimSpace(string(patchData)) != patcher.PatchVersion {
-		return true
-	}
-
-	// Check if a newer Claude version is available
-	newestVersion, _, err := patcher.GetLatestVersion()
-	if err != nil {
-		// Can't reach update server — assume current install is fine
-		return false
-	}
-	if currentVersion != newestVersion {
-		return true
-	}
-
-	// Check if extensions need updating
-	if extensions.NeedsUpdate() {
-		return true
-	}
-
-	return false
+// workerBefore gives the elevated worker access to the WindowsApps folder.
+func workerBefore() error {
+	return patcher.TakeWindowsAppsOwnership()
 }
 
-// claudeInstalled returns true if claude.exe exists in the install directory.
-func claudeInstalled() bool {
-	_, err := os.Stat(claudeExecutablePath())
-	return err == nil
+// workerAfter lets the unelevated launcher read and run the install, and hands
+// WindowsApps back to TrustedInstaller.
+func workerAfter() {
+	patcher.GrantUserReadAccess()
+	patcher.ReleaseWindowsAppsOwnership()
+}
+
+func registerCowork() error {
+	return patcher.RegisterCoworkService()
+}
+
+// cleanupOldInstalls removes earlier installs' folders once they're no longer in use
+// (see patcher.CleanupOldInstalls).
+func cleanupOldInstalls() {
+	patcher.CleanupOldInstalls()
 }

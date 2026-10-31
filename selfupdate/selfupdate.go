@@ -21,6 +21,16 @@ type releaseAsset struct {
 	DownloadURL string
 }
 
+// startedFrom identifies the launcher binary this process was started from, so a
+// launcher that waited for the update lock can tell another one already replaced it.
+var startedFrom os.FileInfo
+
+func init() {
+	if exe, err := os.Executable(); err == nil {
+		startedFrom, _ = os.Stat(exe)
+	}
+}
+
 // FinishUpdateIfNeeded dispatches to the platform-specific update completion logic.
 func FinishUpdateIfNeeded() {
 	exePath, _ := os.Executable()
@@ -33,7 +43,7 @@ func CheckAndUpdate() error {
 	currentVer := CurrentVersion
 
 	// Check latest release
-	url := "https://api.github.com/repos/lugia19/Claude-WebExtension-Launcher/releases/latest"
+	url := "https://api.github.com/repos/AbdelrhmanElbaz/Claude-WebExtension-Launcher/releases/latest"
 	resp, err := http.Get(url)
 	if err != nil {
 		return fmt.Errorf("failed to check for updates: %v", err)
@@ -66,6 +76,14 @@ func CheckAndUpdate() error {
 	}
 
 	fmt.Printf("Update available: %s -> %s\n", currentVer, latestVersion)
+
+	// Serialize the rest: launchers started together would otherwise share the
+	// update-temp files and the platform's staging paths for the new binary.
+	unlock, locked := lockUpdate()
+	if !locked {
+		return fmt.Errorf("another launcher is installing an update; skipping")
+	}
+	defer unlock()
 
 	// Platform-specific asset selection
 	assets := make([]releaseAsset, len(release.Assets))
@@ -145,16 +163,25 @@ func CheckAndUpdate() error {
 
 		os.MkdirAll(filepath.Dir(path), 0755)
 
-		src, _ := f.Open()
-		dst, _ := os.Create(path)
-		io.Copy(dst, src)
-		dst.Close()
-		src.Close()
+		// A truncated or corrupt download must abort the update here (the zip reader
+		// reports CRC mismatches from Read), not reach installUpdate as a partial file.
+		if err := utils.ExtractZipFile(f, path); err != nil {
+			zipReader.Close()
+			os.Remove(tempZip)
+			os.RemoveAll(tempDir)
+			return fmt.Errorf("failed to extract %s: %v", f.Name, err)
+		}
 	}
 	zipReader.Close()
 
 	fmt.Println("Installing update...")
 	return installUpdate(tempDir, tempZip)
+}
+
+// CompareVersions compares two version strings ("1.2.3", optionally "v"-prefixed):
+// negative if v1 is older, 0 if equal, positive if newer.
+func CompareVersions(v1, v2 string) int {
+	return compareVersions(v1, v2)
 }
 
 func compareVersions(v1, v2 string) int {

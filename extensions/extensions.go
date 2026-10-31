@@ -47,6 +47,18 @@ func getInstalledVersion(ext Extension) string {
 	return ""
 }
 
+// isLinked reports whether the extension's folder, or web-extensions itself, is a junction
+// or symlink: a developer's own checkout, left alone since updating would replace it.
+func isLinked(ext Extension) bool {
+	root := utils.ResolveInstallPath("web-extensions")
+	for _, p := range []string{root, filepath.Join(root, ext.Folder)} {
+		if _, err := os.Readlink(p); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
 func fetchLatestRelease(ext Extension) (*extensionRelease, error) {
 	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/latest", ext.Owner, ext.Repo)
 	resp, err := http.Get(url)
@@ -54,29 +66,47 @@ func fetchLatestRelease(ext Extension) (*extensionRelease, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	// Error replies (e.g. a 403 rate limit) are JSON too and would otherwise decode into
+	// an empty release that looks like "no update".
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GitHub returned HTTP %d", resp.StatusCode)
+	}
 	var release extensionRelease
 	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
 		return nil, err
+	}
+	if release.TagName == "" {
+		return nil, fmt.Errorf("GitHub returned a release without a tag")
 	}
 	return &release, nil
 }
 
 // NeedsUpdate checks whether any extension has a newer version available
-// without downloading anything. Used by the unelevated launcher to decide
-// whether to invoke the elevated patcher.
-func NeedsUpdate() bool {
+// without downloading anything. Used by the launcher to decide whether to run the
+// worker. err is set when some lookup failed (e.g. GitHub unreachable or rate
+// limited), so "no update found" can be told apart from "couldn't check".
+func NeedsUpdate() (bool, error) {
+	var failed []string
 	for _, ext := range extensions {
+		if isLinked(ext) {
+			continue
+		}
 		currentVersion := getInstalledVersion(ext)
 		release, err := fetchLatestRelease(ext)
 		if err != nil {
+			fmt.Printf("  %s: error checking: %v\n", ext.Folder, err)
+			failed = append(failed, ext.Folder)
 			continue
 		}
 		releaseVersion := strings.TrimPrefix(release.TagName, "v")
 		if compareVersions(currentVersion, releaseVersion) < 0 {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	if len(failed) > 0 {
+		return false, fmt.Errorf("couldn't check %s for updates", strings.Join(failed, ", "))
+	}
+	return false, nil
 }
 
 func UpdateAll() error {
@@ -85,12 +115,19 @@ func UpdateAll() error {
 	// Create extensions dir if needed
 	os.MkdirAll(utils.ResolveInstallPath("web-extensions"), 0755)
 
+	var failed []string
 	for _, ext := range extensions {
+		if isLinked(ext) {
+			fmt.Printf("  %s: linked folder, not updating\n", ext.Folder)
+			continue
+		}
+
 		currentVersion := getInstalledVersion(ext)
 
 		release, err := fetchLatestRelease(ext)
 		if err != nil {
 			fmt.Printf("  %s: error checking: %v\n", ext.Folder, err)
+			failed = append(failed, ext.Folder)
 			continue
 		}
 
@@ -112,6 +149,7 @@ func UpdateAll() error {
 
 		if downloadURL == "" {
 			fmt.Printf("  %s: no electron zip found\n", ext.Folder)
+			failed = append(failed, ext.Folder)
 			continue
 		}
 
@@ -120,9 +158,13 @@ func UpdateAll() error {
 		// Download and extract
 		if err := downloadAndExtractExtension(downloadURL, ext.Folder); err != nil {
 			fmt.Printf("  %s: error updating: %v\n", ext.Folder, err)
+			failed = append(failed, ext.Folder)
 		}
 	}
 
+	if len(failed) > 0 {
+		return fmt.Errorf("couldn't update %s (see the log)", strings.Join(failed, ", "))
+	}
 	return nil
 }
 
@@ -134,7 +176,9 @@ func downloadAndExtractExtension(url, folder string) error {
 	}
 	defer resp.Body.Close()
 
-	tempFile := utils.ResolvePath(folder + "-temp.zip")
+	// Install path, not launcher-local: on Windows this runs elevated, and the
+	// launcher-local folder is user-writable.
+	tempFile := utils.ResolveInstallPath(folder + "-temp.zip")
 	out, _ := os.Create(tempFile)
 	io.Copy(out, resp.Body)
 	out.Close()
@@ -162,11 +206,9 @@ func downloadAndExtractExtension(url, folder string) error {
 
 		os.MkdirAll(filepath.Dir(path), 0755)
 
-		src, _ := f.Open()
-		dst, _ := os.Create(path)
-		io.Copy(dst, src)
-		dst.Close()
-		src.Close()
+		if err := utils.ExtractZipFile(f, path); err != nil {
+			return fmt.Errorf("extracting %s: %v", f.Name, err)
+		}
 	}
 
 	return nil

@@ -8,7 +8,6 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -44,7 +43,7 @@ func SetupSessionSharing(instanceName string) {
 	// Only the default instance shares sessions with the official install. Named instances
 	// stay isolated (RepairSessionSharing keeps them that way), so the single global store is
 	// only ever linked by {official, Claude-<default>}.
-	if instanceName != defaultInstanceName {
+	if instanceName != mainInstance {
 		return
 	}
 
@@ -60,7 +59,7 @@ func SetupSessionSharing(instanceName string) {
 	}
 	defer lock.Release()
 
-	neutralRoot := filepath.Join(appData, "ClaudeWebExtLauncher", "shared-sessions")
+	neutralRoot := sharedSessionsStore(appData)
 
 	// Always share the patched instance; share the official install too if present.
 	installRoots := []string{filepath.Join(appData, "Claude-"+instanceName)}
@@ -92,7 +91,7 @@ func SetupSessionSharing(instanceName string) {
 // official install's folders too (otherwise those junctions are legitimate). The default
 // instance itself is left alone, since it is meant to be junctioned.
 func RepairSessionSharing(instanceName string) {
-	if instanceName == defaultInstanceName {
+	if instanceName == mainInstance {
 		return
 	}
 
@@ -159,7 +158,7 @@ func restoreRealFolder(link string) bool {
 // defaultInstanceIsSharing reports whether the default instance is currently set up to share
 // with the official install (its Cowork session folder is a junction).
 func defaultInstanceIsSharing(appData string) bool {
-	link := filepath.Join(appData, "Claude-"+defaultInstanceName, sharedSessionFolders[0])
+	link := filepath.Join(appData, "Claude-"+mainInstance, sharedSessionFolders[0])
 	_, err := os.Readlink(link)
 	return err == nil
 }
@@ -239,7 +238,7 @@ func makeJunction(link, target string) error {
 	if err := os.MkdirAll(filepath.Dir(link), 0755); err != nil {
 		return err
 	}
-	out, err := exec.Command("cmd", "/c", "mklink", "/J", link, target).CombinedOutput()
+	out, err := utils.Command("cmd", "/c", "mklink", "/J", link, target).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("mklink /J %q %q failed: %v\n%s", link, target, err, out)
 	}
@@ -308,4 +307,84 @@ func samePath(a, b string) bool {
 		return strings.EqualFold(filepath.Clean(a), filepath.Clean(b))
 	}
 	return strings.EqualFold(ca, cb)
+}
+
+// sharedSessionsStore is where the shared sessions really live (see SetupSessionSharing).
+func sharedSessionsStore(appData string) string {
+	return filepath.Join(appData, "ClaudeWebExtLauncher", "shared-sessions")
+}
+
+// sessionsShared reports whether there's a shared sessions store to undo.
+func sessionsShared() bool {
+	appData := os.Getenv("APPDATA")
+	if appData == "" {
+		return false
+	}
+	_, err := os.Stat(sharedSessionsStore(appData))
+	return err == nil
+}
+
+// unshareSessions undoes SetupSessionSharing for good (uninstall): every Claude folder
+// linked to the shared store (the official Claude's, and the instances') gets a real
+// folder again, holding a copy of the sessions, and then the store is removed. Nothing
+// is deleted while anything still links to it, so the official Claude keeps its
+// sessions. With copyIntoInstances false (their data is about to be deleted) the
+// instances' links are just removed, not filled.
+func unshareSessions(instances []string, copyIntoInstances bool) error {
+	appData := os.Getenv("APPDATA")
+	if appData == "" {
+		return nil
+	}
+	lock, locked := utils.AcquirePatchLock(sessionLockName, sessionLockTimeout)
+	if !locked {
+		return fmt.Errorf("another launcher is changing the shared sessions")
+	}
+	defer lock.Release()
+
+	for _, folder := range sharedSessionFolders {
+		if err := unshareFolder(filepath.Join(appData, "Claude", folder), true); err != nil {
+			return err
+		}
+		for _, name := range instances {
+			if err := unshareFolder(filepath.Join(claudeUserDataDir(name), folder), copyIntoInstances); err != nil {
+				return err
+			}
+		}
+	}
+	if err := os.RemoveAll(sharedSessionsStore(appData)); err != nil {
+		return fmt.Errorf("removing the shared sessions store: %w", err)
+	}
+	return nil
+}
+
+// unshareFolder replaces the junction link (if it is one) with a real folder, holding
+// a copy of what it pointed at if fill. Removing a junction removes only the link,
+// never its target.
+func unshareFolder(link string, fill bool) error {
+	target, err := os.Readlink(link)
+	if err != nil {
+		return nil // not a link (or not there): nothing to undo
+	}
+	fmt.Printf("Unsharing %s (was linked to %s)\n", link, target)
+	if err := os.Remove(link); err != nil {
+		return fmt.Errorf("removing the link %s: %w", link, err)
+	}
+	if _, err := os.Stat(target); err != nil || !fill {
+		return os.MkdirAll(link, 0755)
+	}
+	if err := mergeTree(target, link); err != nil {
+		return fmt.Errorf("copying the sessions into %s: %w", link, err)
+	}
+	return nil
+}
+
+// safeToDelete reports whether dir holds no session junction, which RemoveAll could
+// otherwise follow into the shared store.
+func safeToDelete(dir string) bool {
+	for _, folder := range sharedSessionFolders {
+		if _, err := os.Readlink(filepath.Join(dir, folder)); err == nil {
+			return false
+		}
+	}
+	return true
 }

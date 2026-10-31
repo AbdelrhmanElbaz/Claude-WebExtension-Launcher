@@ -1,74 +1,118 @@
-name: Build Launcher
+# Builds the Windows launcher on each push and pull request (this fork is Windows-only). The window
+# (Fyne) needs cgo, so each platform builds on its own runner, through the same
+# scripts used locally. The zips are kept as the run's artifacts, named as the
+# self-updater expects. On a pull request, a comment links them.
+#
+# Pushing a version tag (git tag v3.4.0 && git push origin v3.4.0) also creates a
+# draft release with the zips attached; it stays invisible to users and to the
+# self-updater until it's published.
+name: Build
 
 on:
   push:
-    branches: [ master, main ]
+    branches: [master]
+    tags: ["v*"]
   pull_request:
-  workflow_dispatch:   # يسمح لك تشغّله يدويًا من تبويب Actions بضغطة زر
+  workflow_dispatch:
 
-permissions:
-  contents: write   # عشان يقدر يرفع الملفات كـ artifact / release
+# A new push to a pull request supersedes its running build.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Release builds are kept with the release; other runs' zips only for a while.
+  ARTIFACT_DAYS: ${{ startsWith(github.ref, 'refs/tags/v') && 90 || 14 }}
 
 jobs:
-  build-windows:
+  # On a tag, check it matches Version in main.go before building anything.
+  check-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          VERSION=$(grep 'const Version = ' main.go | sed 's/.*"\(.*\)".*/\1/')
+          if [ "${GITHUB_REF_NAME#v}" != "$VERSION" ]; then
+            echo "Tag $GITHUB_REF_NAME doesn't match Version $VERSION in main.go"
+            exit 1
+          fi
+
+  windows:
+    needs: check-tag
     runs-on: windows-latest
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
-
-      # لو عندك MinGW/CGO مطلوب لـ Fyne على ويندوز
-      - name: Install MinGW (CGO dependency for Fyne)
-        run: choco install mingw -y
-
-      - name: Download Go modules
-        run: go mod tidy
-
-      - name: Build (Windows)
+          go-version-file: go.mod
+      - name: Vet and test
+        run: go vet ./... && go test ./...
+        env:
+          CGO_ENABLED: "1"
+      - name: Build
         shell: pwsh
-        run: |
-          $env:CGO_ENABLED = "1"
-          .\build-windows.ps1
-
-      - name: Upload Windows build artifact
-        uses: actions/upload-artifact@v4
+        run: ./build-windows.ps1
+      - uses: actions/upload-artifact@v4
         with:
-          name: windows-build
-          path: |
-            builds/*.exe
-            builds/*.zip
-          if-no-files-found: warn
+          name: windows
+          path: builds/*.zip
+          if-no-files-found: error
+          compression-level: 0 # already zipped
+          retention-days: ${{ env.ARTIFACT_DAYS }}
 
-  build-macos:
-    runs-on: macos-14   # macOS 14 = Apple Silicon (arm64) runner
+
+  # On a pull request, keep one comment linking the latest run's zips. Fork PRs get a
+  # read-only token, so they're skipped.
+  pr-artifacts:
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    needs: [windows]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      pull-requests: write
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.21'
-
-      - name: Download Go modules
-        run: go mod tidy
-
-      - name: Build (macOS arm64)
+      - name: Comment the artifact links
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          chmod +x build-macos-arm64.sh
-          ./build-macos-arm64.sh
+          MARKER='<!-- build-artifacts -->'
+          ROWS=$(gh api "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID/artifacts" --jq '
+            {"windows": "Windows", "ubuntu-22.04": "Linux amd64", "ubuntu-22.04-arm": "Linux arm64", "macos": "macOS (arm64 + amd64)"} as $names
+            | .artifacts | sort_by(.name)[]
+            | "| \($names[.name] // .name) | [\(.name).zip](\(env.RUN_URL)/artifacts/\(.id)) | \(.size_in_bytes / 1048576 | floor) MB |"')
+          BODY=$(printf '%s\n### Build artifacts\n\nFor %s ([run](%s)). Kept %s days; downloading needs a GitHub login.\n\n| Platform | Download | Size |\n|---|---|---|\n%s\n' \
+            "$MARKER" "${SHA:0:7}" "$RUN_URL" "$ARTIFACT_DAYS" "$ROWS")
+          ID=$(gh api "repos/$GH_REPO/issues/$PR/comments" --paginate \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$MARKER\"))) | .id" | head -n1)
+          if [ -n "$ID" ]; then
+            gh api -X PATCH "repos/$GH_REPO/issues/comments/$ID" -f body="$BODY" >/dev/null
+          else
+            gh pr comment "$PR" --body "$BODY"
+          fi
 
-      - name: Upload macOS build artifact
-        uses: actions/upload-artifact@v4
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
         with:
-          name: macos-arm64-build
-          path: |
-            *.app
-            build/**
-            dist/**
-            builds/**
-          if-no-files-found: warn
+          path: dist
+          merge-multiple: true
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.zip --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*.zip --draft --title "$GITHUB_REF_NAME" --generate-notes
+          fi

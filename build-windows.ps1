@@ -20,28 +20,20 @@ if (!(Test-Path ".\builds")) {
 	New-Item -ItemType Directory -Path ".\builds" | Out-Null
 }
 
+# The window (Fyne) needs cgo: gcc from WinLibs/MinGW-w64 on the PATH.
+if (!(Get-Command gcc -ErrorAction SilentlyContinue)) {
+	Write-Host "ERROR: gcc not found. Install WinLibs (winget install BrechtSanders.WinLibs.POSIX.UCRT) and open a new terminal." -ForegroundColor Red
+	exit 1
+}
+
 # Build for Windows
 Write-Host "`nBuilding for Windows..." -ForegroundColor Cyan
 $env:GOOS = "windows"
 $env:GOARCH = "amd64"
-& go build -o ".\builds\$APP_NAME.exe"
+$env:CGO_ENABLED = "1"
+& go build -ldflags "-H=windowsgui" -o ".\builds\$APP_NAME.exe"
 
 if (Test-Path ".\builds\$APP_NAME.exe") {
-	# Add icon if rcedit exists
-	if (Test-Path ".\resources\rcedit.exe") {
-		Write-Host "Embedding icon..." -ForegroundColor Cyan
-		& ".\resources\rcedit.exe" ".\builds\$APP_NAME.exe" --set-icon ".\resources\icons\app.ico"
-		if ($LASTEXITCODE -eq 0) {
-			Write-Host "Icon embedded successfully" -ForegroundColor Green
-		}
-		else {
-			Write-Host "Warning: Failed to embed icon" -ForegroundColor Yellow
-		}
-	}
- else {
-		Write-Host "Warning: rcedit.exe not found, skipping icon embedding" -ForegroundColor Yellow
-	}
-
 	Write-Host "Windows build complete: builds\$APP_NAME.exe" -ForegroundColor Green
     
 	# Create distribution zip using PowerShell's Compress-Archive
@@ -61,11 +53,8 @@ if (Test-Path ".\builds\$APP_NAME.exe") {
 	}
 	New-Item -ItemType Directory -Path $tempDir | Out-Null
     
-	# Copy executable and batch scripts to temp directory
+	# Copy the executable to the temp directory
 	Copy-Item ".\builds\$APP_NAME.exe" "$tempDir\$APP_NAME.exe"
-	Copy-Item ".\resources\Toggle-Startup.bat" "$tempDir\Toggle-Startup.bat"
-	Copy-Item ".\resources\Toggle-StartMenu.bat" "$tempDir\Toggle-StartMenu.bat"
-	Copy-Item ".\resources\Uninstall.bat" "$tempDir\Uninstall.bat"
     
 	# Create the zip file from temp directory
 	Compress-Archive -Path "$tempDir\*" -DestinationPath $zipPath -CompressionLevel Optimal

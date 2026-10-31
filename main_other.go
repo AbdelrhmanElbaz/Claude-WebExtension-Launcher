@@ -3,85 +3,50 @@
 package main
 
 import (
-	"claude-webext-patcher/extensions"
-	"claude-webext-patcher/patcher"
-	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"runtime"
-	"strings"
+	"time"
 )
 
-// prepareAdminContext relaunches the launcher inside Terminal.app on macOS
-// when there is no controlling terminal, so console output is visible.
-// On other non-Windows platforms it is a no-op.
-func prepareAdminContext() error {
-	if runtime.GOOS == "darwin" && os.Getenv("TERM") == "" {
-		executable, _ := os.Executable()
-		execDir := filepath.Dir(executable)
+const (
+	// patchLockName serializes the worker across launchers started together (e.g.
+	// several named instances), which share the staging, asar-temp and
+	// web-extensions paths.
+	patchLockName = "patch"
+	// patchLockTimeout is generous: a real update downloads Claude (~175-250 MB).
+	patchLockTimeout = 10 * time.Minute
+	// workerStartingNote is a row's note until the worker reports on it.
+	workerStartingNote = "starting"
+	// nodeInspectorSupported: nothing turns on Electron's --inspect fuse here (that's
+	// version.dll, on Windows), so the launch options have no Node inspector.
+	nodeInspectorSupported = false
+)
 
-		// Change to the executable's directory, run, then exit terminal
-		// Escape single quotes in paths for AppleScript
-		execDirEscaped := strings.ReplaceAll(execDir, `'`, `'\''`)
-		executableEscaped := strings.ReplaceAll(executable, `'`, `'\''`)
-		script := fmt.Sprintf(`tell application "Terminal"
-			set newTab to do script "cd '%s' && '%s' && exit"
-			activate
-		end tell`, execDirEscaped, executableEscaped)
+// ensureConsole is a no-op outside Windows, which has no GUI/console subsystem split.
+func ensureConsole() {}
 
-		cmd := exec.Command("osascript", "-e", script)
-		cmd.Start()
-		os.Exit(0)
+// startWorker runs the worker as a child process (same user, no elevation) and
+// returns its exit code. Its output joins the launcher's (the log file).
+func startWorker(args []string) (int, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return -1, err
 	}
-	return nil
+	cmd := exec.Command(exe, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	err = cmd.Run()
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		return exitErr.ExitCode(), nil
+	}
+	if err != nil {
+		return -1, err
+	}
+	return 0, nil
 }
 
-// releaseAdminContext is a no-op on non-Windows platforms.
-func releaseAdminContext() {}
-
-func claudeUserDataDir(instance string) string {
-	if runtime.GOOS == "darwin" {
-		home, _ := os.UserHomeDir()
-		return filepath.Join(home, "Library", "Application Support", "Claude-"+instance)
-	}
-	return ""
-}
-
-func claudeExecutablePath() string {
-	if runtime.GOOS == "darwin" {
-		return filepath.Join(patcher.AppFolder, "Claude.app", "Contents", "MacOS", "Claude")
-	}
-	// Linux and other Unix-like systems
-	return filepath.Join(patcher.AppFolder, "claude")
-}
-
-// claudeInstalled returns true if the Claude executable exists in the install directory.
-func claudeInstalled() bool {
-	_, err := os.Stat(claudeExecutablePath())
-	return err == nil
-}
-
-// ensureClaudeReady runs patching and extension updates in-process on macOS.
-func ensureClaudeReady(forceUpdate bool) error {
-	if err := patcher.EnsurePatched(forceUpdate); err != nil {
-		if claudeInstalled() {
-			fmt.Printf("Warning: patching failed (%v), launching existing installation.\n", err)
-		} else {
-			return err
-		}
-	}
-	if err := extensions.UpdateAll(); err != nil {
-		fmt.Printf("Warning: extension update failed: %v\n", err)
-	}
-	if err := patcher.DeploySentinelExtension(); err != nil {
-		fmt.Printf("Warning: sentinel extension deployment failed: %v\n", err)
-	}
-	return nil
-}
-
-// runPatcherMode is not used on non-Windows platforms.
-func runPatcherMode(forceUpdate bool, debug bool) int {
-	fmt.Println("--patcher is not supported on this platform")
-	return 1
-}
+// Worker hooks: nothing to set up, register or clean up outside Windows.
+func workerBefore() error   { return nil }
+func workerAfter()          {}
+func registerCowork() error { return nil }
+func cleanupOldInstalls()   {}

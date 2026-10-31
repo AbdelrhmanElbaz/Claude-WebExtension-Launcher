@@ -7,8 +7,29 @@ const fs = require("fs");
 // ================================================================
 // Instance isolation — redirect userData before anything reads it
 // ================================================================
-const instanceArg = process.argv.find(a => a.startsWith("--instance="));
-const instanceName = instanceArg ? instanceArg.split("=")[1] : "modified";
+// Parse instance name supporting both `--instance=name` and `--instance name`.
+// Without one it's the main instance, "Main". That used to be "modified": the launcher
+// renames its data folder, but until it has, keep using the old one (e.g. Claude
+// started from a taskbar pin before the launcher's first run since the rename).
+let instanceName = "Main";
+if (!fs.existsSync(path.join(app.getPath("appData"), app.getName() + "-Main")) &&
+    fs.existsSync(path.join(app.getPath("appData"), app.getName() + "-modified"))) {
+    instanceName = "modified";
+}
+const eqArg = process.argv.find(a => a.startsWith("--instance="));
+const spaceIdx = process.argv.indexOf("--instance");
+
+if (eqArg) {
+    // Internal launcher format: --instance=name
+    instanceName = eqArg.split("=")[1];
+} else if (spaceIdx !== -1 && spaceIdx + 1 < process.argv.length) {
+    // User/shortcut format: --instance name
+    // Guard against accidentally grabbing a trailing flag if the value is missing
+    const nextArg = process.argv[spaceIdx + 1];
+    if (!nextArg.startsWith("--")) {
+        instanceName = nextArg;
+    }
+}
 app.setPath("userData", path.join(
     app.getPath("appData"),
     app.getName() + "-" + instanceName
@@ -25,6 +46,55 @@ app.requestSingleInstanceLock = function(...args) {
     app.setName(originalName);
     return result;
 };
+
+// ================================================================
+// Remote debugging and developer mode — set per instance in the launcher
+// ================================================================
+// Claude refuses to start when a debugging switch is on the command line, unless its
+// E2E token check passes. The launcher adds a marker flag next to the switches it adds,
+// so only a launch from the launcher gets through; the same switches without it are
+// still refused, as in the official app.
+// - --webext-dev-mode (advanced debug mode): the patched token checks (patchDevModeGate
+//   in patcher.go) pass, which also lets the debugging switches through and turns on
+//   Claude's test features. version.dll turns on the --inspect fuse for it too.
+// - --webext-remote-debugging: the debugging switches are hidden from Claude's check.
+//   Chromium has already read them from the real command line, so the port still opens.
+if (process.argv.includes("--webext-dev-mode")) {
+    globalThis.__webextDevMode = true;
+    console.log("[webext] Advanced debug mode on");
+    // SSLKEYLOGFILE only covers Chromium's networking. Node's own TLS in this process
+    // (https, fetch, WebSockets; all through tls.connect) gets its session keys
+    // appended to the same file, from each socket's keylog event: Electron ignores
+    // Node's --tls-keylog in a packaged app.
+    const keyLog = process.env.SSLKEYLOGFILE;
+    if (keyLog) {
+        let fd = null; // opened on first use; written synchronously, so the keys are in
+                       // the file before the connection's traffic
+        const tls = require("tls");
+        const connect = tls.connect;
+        tls.connect = function (...args) {
+            const socket = connect.apply(this, args);
+            socket.on("keylog", line => {
+                try {
+                    fd ??= fs.openSync(keyLog, "a");
+                    fs.writeSync(fd, line);
+                } catch {}
+            });
+            return socket;
+        };
+        console.log("[webext] Logging Node TLS keys to " + keyLog);
+    }
+} else if (process.argv.includes("--webext-remote-debugging")) {
+    // Normalized like Claude's own check: no leading -, -- or /, lowercase, no =value.
+    const switchName = a => a.replace(/^(?:--|-|\/)/, "").toLowerCase().split("=", 1)[0];
+    for (let i = process.argv.length - 1; i > 0; i--) {
+        const name = switchName(process.argv[i]);
+        if (name.startsWith("remote-debugging-port") || name.startsWith("remote-debugging-pipe")) {
+            process.argv.splice(i, 1); // in place: other code holds this array
+        }
+    }
+    console.log("[webext] Remote debugging allowed");
+}
 
 // ================================================================
 // Find the web-extensions directory by walking up from app path
@@ -184,27 +254,6 @@ function setupPolyfills() {
             }
             return;
         }
-
-        // Usage export polyfill — writes a small per-instance JSON snapshot
-        // the Go launcher UI reads directly. No cookies, no crypto: this is
-        // literally the extension's own already-computed data, handed to us
-        // voluntarily via the same console-bridge used for alarms/notifications.
-        if (message.startsWith("CUT_USAGE:")) {
-            try {
-                const usageData = JSON.parse(message.substring("CUT_USAGE:".length));
-                const usageDir = path.join(app.getPath("appData"), "ClaudeWebExtLauncher", "usage");
-                fs.mkdirSync(usageDir, { recursive: true });
-                const outPath = path.join(usageDir, `${instanceName}.json`);
-                fs.writeFileSync(outPath, JSON.stringify({
-                    instance: instanceName,
-                    updatedAt: Date.now(),
-                    usageData
-                }, null, 2));
-            } catch (err) {
-                console.error("[Node] Failed to write usage export:", err);
-            }
-            return;
-        }
     });
 
     function fireAlarm(name) {
@@ -288,6 +337,202 @@ app.on("web-contents-created", (event, contents) => {
         detect(contents.getURL());
     });
 });
+
+// ================================================================
+// Tray menu — instance name, and 5-hour and weekly usage
+// ================================================================
+// Claude's tray menu is: Show App, separator, its usage rows ("<tier> plan" and
+// "Usage: X%", the highest of all limits), separator, Exit; without usage rows it's just
+// Show App, separator, Exit. Every menu it gives the tray is rebuilt with those rows
+// replaced by the instance name and the 5-hour and weekly percentages. The rows are found
+// by position, so it works in every language; anything unexpected leaves Claude's menu as
+// it is. The percentages come from Claude's own usage requests (net.fetch to
+// /api/organizations/<org>/usage), read from a copy of each response.
+(() => {
+    const { Menu, Tray, net } = require("electron");
+    if (typeof Tray?.prototype?.setContextMenu !== "function" || typeof net?.fetch !== "function") {
+        return;
+    }
+    const usageURL = /\/api\/organizations\/[^/?]+\/usage(?:\?|$)/;
+    const usage = { fiveHour: null, weekly: null };
+    let lastRequest = 0; // only the newest request's answer counts (e.g. after an org switch)
+
+    const fetch = net.fetch;
+    net.fetch = function (input, ...rest) {
+        const result = fetch.call(this, input, ...rest);
+        const url = typeof input === "string" ? input : input?.url;
+        if (typeof url === "string" && usageURL.test(url)) {
+            const request = ++lastRequest;
+            result.then(response => {
+                if (!response.ok) return;
+                return response.clone().json().then(data => {
+                    if (request !== lastRequest) return;
+                    // Two response shapes: five_hour/seven_day, or a limits array.
+                    const limits = Array.isArray(data?.limits) ? data.limits : [];
+                    const byKind = kind => limits.find(l => l?.kind === kind)?.percent;
+                    usage.fiveHour = data?.five_hour?.utilization ?? byKind("session") ?? null;
+                    usage.weekly = data?.seven_day?.utilization ?? byKind("weekly_all") ?? null;
+                    writeUsageSnapshot();
+                    refresh(); // Claude may have rebuilt its menu before this was read
+                });
+            }).catch(() => {});
+        }
+        return result;
+    };
+
+    const percent = value => typeof value === "number" ? Math.round(value) + "%" : "–";
+    // The legacy main instance name is still the main instance.
+    const shownName = instanceName === "modified" ? "Main" : instanceName;
+
+    // The launcher's instance list shows these numbers too: each reading is also written
+    // to <LOCALAPPDATA>\ClaudeWebExtLauncher\usage\<instance>.json (see utils/usage.go).
+    function writeUsageSnapshot() {
+        try {
+            const dir = path.join(process.env.LOCALAPPDATA || app.getPath("appData"), "ClaudeWebExtLauncher", "usage");
+            fs.mkdirSync(dir, { recursive: true });
+            fs.writeFileSync(path.join(dir, shownName + ".json"), JSON.stringify({
+                instance: shownName,
+                updatedAt: Date.now(),
+                fiveHour: typeof usage.fiveHour === "number" ? usage.fiveHour : null,
+                weekly: typeof usage.weekly === "number" ? usage.weekly : null,
+            }));
+        } catch (err) {
+            console.error("[webext] Failed to write usage snapshot:", err);
+        }
+    }
+
+    // copyItem turns a built MenuItem back into a template (keeping its click handler).
+    function copyItem(item) {
+        const template = {};
+        for (const key of ["id", "label", "sublabel", "toolTip", "type", "role", "enabled", "visible",
+                           "checked", "accelerator", "icon", "click"]) {
+            if (item[key] !== undefined && item[key] !== null) template[key] = item[key];
+        }
+        if (item.submenu) template.submenu = item.submenu;
+        return template;
+    }
+
+    // The native tray doesn't keep its menu from being garbage collected, so a menu on
+    // screen (a popup runs its own message loop) could be freed under it. Claude keeps its
+    // last 32 menus for that reason; the rebuilt ones are kept the same way.
+    const kept = [];
+    function keep(menu) {
+        kept.push(menu);
+        if (kept.length > 32) kept.shift();
+        return menu;
+    }
+
+    // rebuild returns Claude's menu with its usage rows replaced, or it unchanged.
+    function rebuild(menu) {
+        try {
+            const items = menu.items;
+            const separators = [];
+            items.forEach((item, i) => item.type === "separator" && separators.push(i));
+            if (separators.length === 0) return menu;
+            const first = separators[0], last = separators[separators.length - 1];
+            const hadUsage = last > first + 1; // rows between two separators
+            const disabled = label => ({ label, enabled: false });
+            const lines = [
+                disabled("Instance: " + shownName),
+                disabled("5h: " + (hadUsage ? percent(usage.fiveHour) : "–")),
+                disabled("Weekly: " + (hadUsage ? percent(usage.weekly) : "–")),
+            ];
+            const template = [
+                ...items.slice(0, first + 1).map(copyItem),
+                ...lines,
+                { type: "separator" },
+                ...items.slice((hadUsage ? last : first) + 1).map(copyItem),
+            ];
+            return keep(Menu.buildFromTemplate(template));
+        } catch (e) {
+            console.error("[webext] Couldn't rebuild the tray menu:", e);
+            return menu;
+        }
+    }
+
+    let lastTray = null, lastMenu = null;
+    const setContextMenu = Tray.prototype.setContextMenu;
+    Tray.prototype.setContextMenu = function (menu) {
+        lastTray = this;
+        lastMenu = menu;
+        return setContextMenu.call(this, menu ? rebuild(menu) : menu);
+    };
+    const popUpContextMenu = Tray.prototype.popUpContextMenu;
+    if (typeof popUpContextMenu === "function") {
+        Tray.prototype.popUpContextMenu = function (menu, ...rest) {
+            return popUpContextMenu.call(this, menu ? rebuild(menu) : menu, ...rest);
+        };
+    }
+
+    // refresh re-applies Claude's last menu with the current numbers.
+    function refresh() {
+        if (lastTray && lastMenu && !lastTray.isDestroyed()) {
+            setContextMenu.call(lastTray, rebuild(lastMenu));
+        }
+    }
+    console.log("[webext] Tray menu: instance name and usage lines");
+})();
+
+// ================================================================
+// Claude QoL: custom system prompt for local Code sessions
+// ================================================================
+// QoL stores {text, mode: "append"|"replace"} in claude.ai's localStorage. The page's
+// LocalSessions.start/prewarm* calls reach these main-process handlers, so add the prompt
+// to their info argument here. All three get the same change, so prewarmed sessions still match.
+{
+    const channel = /_\$_claude\.web_\$_LocalSessions_\$_(?:start|prewarmLocal|prewarmFolderless)$/;
+    const readPrompt = async frame => {
+        try {
+            const raw = await Promise.race([
+                frame.executeJavaScript('localStorage.getItem("claude_qol_code_prompt")'),
+                new Promise(r => setTimeout(r, 1000, null)),
+            ]);
+            const p = raw && JSON.parse(raw);
+            return p && typeof p.text === "string" && p.text.trim() ? p : null;
+        } catch { return null; }
+    };
+    // The app checks the arguments before running anything, so a call rejected with this was
+    // never started and can be retried as the page sent it (e.g. a Claude update dropped a field).
+    const invalidArgs = /^Argument .* failed to pass validation$/;
+    const wrapListener = (name, orig) => async function (event, info, ...rest) {
+        const p = info && typeof info === "object" && await readPrompt(event.senderFrame ?? event.sender);
+        if (!p) return orig.call(this, event, info, ...rest);
+        const patched = { ...info };
+        const mode = p.mode === "replace" ? "replace" : "append";
+        if (mode === "replace") patched.systemPrompt = p.text;
+        else patched.systemPromptAppend = info.systemPromptAppend ? info.systemPromptAppend + "\n\n" + p.text : p.text;
+        const method = name.split("_$_").pop();
+        try {
+            const result = await orig.call(this, event, patched, ...rest);
+            console.log(`[webext] QoL code prompt (${mode}) added to ${method}`);
+            return result;
+        } catch (err) {
+            if (!invalidArgs.test(err?.message)) throw err;
+            console.error(`[webext] QoL code prompt rejected by ${method}, starting without it:`, err.message);
+            return orig.call(this, event, info, ...rest);
+        }
+    };
+    // The handlers are registered on each window's webContents.ipc. Electron gives every
+    // IpcMainImpl its own handle (an arrow-function field, not a prototype method), so wrap
+    // it per instance, as soon as the webContents exists and before the app registers on it.
+    // This runs while Electron creates the webContents: if a future Electron changes ipc,
+    // skip the feature rather than throw there.
+    app.on("web-contents-created", (_e, wc) => {
+        try {
+            const ipc = wc.ipc;
+            const handle = ipc?.handle;
+            if (typeof handle !== "function") return;
+            ipc.handle = function (name, listener) {
+                if (typeof name === "string" && channel.test(name) && typeof listener === "function") {
+                    listener = wrapListener(name, listener);
+                }
+                return handle.call(this, name, listener);
+            };
+        } catch (err) {
+            console.error("[webext] Couldn't hook IPC for the QoL code prompt:", err);
+        }
+    });
+}
 
 // ================================================================
 // Boot the original app
